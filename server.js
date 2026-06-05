@@ -447,7 +447,14 @@ const server = http.createServer(function (req, res) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       return res.end(html);
     }
-    if (method === 'GET' && pathname === '/ping') {
+    // Health check. Tolerate HEAD (UptimeRobot's default probe method)
+    // and an optional trailing slash so external pings never 404.
+    if ((method === 'GET' || method === 'HEAD') &&
+        (pathname === '/ping' || pathname === '/ping/')) {
+      if (method === 'HEAD') {
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+        return res.end();
+      }
       return sendJson(res, 200, { status: 'ok' });
     }
 
