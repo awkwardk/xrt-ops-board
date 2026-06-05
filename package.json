@@ -1,0 +1,15 @@
+{
+  "name": "xrt-ops-board",
+  "version": "1.0.0",
+  "description": "XRT Ops Board — mobile-first team communication board for Xtreme Electronic Recycling",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node ops-test.js server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "private": true
+}
