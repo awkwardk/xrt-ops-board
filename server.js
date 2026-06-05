@@ -633,6 +633,8 @@ header{position:sticky; top:0; z-index:20; background:#fff;
 .photo-btn{flex:1; min-height:44px; border:1.5px solid var(--green); background:#fff;
   color:var(--green); border-radius:10px; font-size:14px; font-weight:600;}
 .photo-btn:active{background:var(--green-light);}
+.photo-msg{font-size:12px; color:var(--warning); margin-top:6px; display:none;}
+.photo-msg.show{display:block;}
 .preview-row{display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;}
 .preview{position:relative; width:72px; height:72px;}
 .preview img{width:72px; height:72px; object-fit:cover; border-radius:8px;
@@ -779,6 +781,7 @@ const BODY_STR = `
       <input type="file" id="in-camera" accept="image/*" capture="environment" class="hidden">
       <input type="file" id="in-photos" accept="image/*" multiple class="hidden">
       <div class="preview-row" id="previewRow"></div>
+      <div class="photo-msg" id="photoMsg"></div>
     </div>
     <button class="btn-primary" id="postBtn">Post Update</button>
     <button class="btn-text" id="addCancel">Cancel</button>
@@ -1063,6 +1066,7 @@ const JS_STR = `
   /* ---------- Add update modal ---------- */
   function openAdd(){
     clearErrors();
+    hidePhotoMsg();
     $("addOverlay").classList.add("show");
   }
   function closeAdd(){
@@ -1083,7 +1087,7 @@ const JS_STR = `
         div.className = "preview";
         div.innerHTML = '<img src="'+e.target.result+'"><button class="rm" data-rm="'+idx+'">&times;</button>';
         div.querySelector(".rm").addEventListener("click", function(){
-          state.photos.splice(idx,1); renderPreviews();
+          state.photos.splice(idx,1); hidePhotoMsg(); renderPreviews();
         });
         row.appendChild(div);
       };
@@ -1118,11 +1122,26 @@ const JS_STR = `
     } catch (err){ cb(file); }
   }
 
+  function showPhotoMsg(text){
+    var el = $("photoMsg"); el.textContent = text; el.classList.add("show");
+  }
+  function hidePhotoMsg(){
+    var el = $("photoMsg"); el.textContent = ""; el.classList.remove("show");
+  }
+
   function onPhotoSelect(e){
-    var files = Array.prototype.slice.call(e.target.files);
+    var files = Array.prototype.slice.call(e.target.files).filter(function(f){
+      return f.type.indexOf("image/") === 0;
+    });
     e.target.value = "";
+    var capacity = Math.max(0, 3 - state.photos.length);
+    if (files.length > capacity){
+      var dropped = files.length - capacity;
+      showPhotoMsg("Max 3 photos \\u2014 " + dropped + " not added.");
+    } else {
+      hidePhotoMsg();
+    }
     files.forEach(function(file){
-      if (file.type.indexOf("image/") !== 0) return;
       compressPhoto(file, function(blob){
         if (state.photos.length >= 3) return; // 3 total across both inputs
         state.photos.push(blob);
