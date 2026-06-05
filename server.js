@@ -253,7 +253,8 @@ function handleGetPosts(req, res, query) {
   let list = posts;
   const loc = query.location;
   if (loc && loc !== 'All') {
-    list = posts.filter(function (p) { return p.location === loc; });
+    // Posts tagged "All" appear under every location filter.
+    list = posts.filter(function (p) { return p.location === loc || p.location === 'All'; });
   }
   sendJson(res, 200, sortPosts(list));
 }
@@ -750,6 +751,7 @@ const BODY_STR = `
         <option value="Cole">Cole</option>
         <option value="Dayton">Dayton</option>
         <option value="Visalia">Visalia</option>
+        <option value="All">All Locations</option>
       </select>
       <div class="err">Please choose a location</div>
     </div>
@@ -932,7 +934,7 @@ const JS_STR = `
   function renderStats(){
     var loc = state.location;
     var todays = state.posts.filter(function(p){
-      return (loc==="All" || p.location===loc) && isToday(p.timestamp);
+      return (loc==="All" || p.location===loc || p.location==="All") && isToday(p.timestamp);
     });
     var urgent = todays.filter(function(p){ return p.tag==="urgent"; }).length;
     var done = todays.filter(function(p){ return p.tag==="success"; }).length;
@@ -948,7 +950,7 @@ const JS_STR = `
   /* ---------- Feed ---------- */
   function renderFeed(){
     var loc = state.location;
-    var list = state.posts.filter(function(p){ return loc==="All" || p.location===loc; });
+    var list = state.posts.filter(function(p){ return loc==="All" || p.location===loc || p.location==="All"; });
     if (!list.length){
       $("feed").innerHTML = '<div class="empty">No updates for '+esc(loc)+' yet.<br>Tap + to post one.</div>';
       return;
@@ -1089,15 +1091,44 @@ const JS_STR = `
     });
   }
 
+  // Compress an image File to <=800px on the longest side, JPEG q0.75.
+  // Falls back to the original file if anything goes wrong.
+  function compressPhoto(file, cb){
+    try {
+      var url = URL.createObjectURL(file);
+      var img = new Image();
+      img.onload = function(){
+        var max = 800;
+        var w = img.width, h = img.height;
+        if (w >= h && w > max){ h = Math.round(h * max / w); w = max; }
+        else if (h > w && h > max){ w = Math.round(w * max / h); h = max; }
+        var canvas = document.createElement("canvas");
+        canvas.width = w; canvas.height = h;
+        var ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, w, h);
+        URL.revokeObjectURL(url);
+        if (canvas.toBlob){
+          canvas.toBlob(function(blob){ cb(blob || file); }, "image/jpeg", 0.75);
+        } else {
+          cb(file);
+        }
+      };
+      img.onerror = function(){ URL.revokeObjectURL(url); cb(file); };
+      img.src = url;
+    } catch (err){ cb(file); }
+  }
+
   function onPhotoSelect(e){
     var files = Array.prototype.slice.call(e.target.files);
-    for (var i=0;i<files.length;i++){
-      if (state.photos.length >= 3) break;
-      if (files[i].size > 2*1024*1024){ alert("Photo too large (max 2MB): "+files[i].name); continue; }
-      state.photos.push(files[i]);
-    }
     e.target.value = "";
-    renderPreviews();
+    files.forEach(function(file){
+      if (file.type.indexOf("image/") !== 0) return;
+      compressPhoto(file, function(blob){
+        if (state.photos.length >= 3) return; // 3 total across both inputs
+        state.photos.push(blob);
+        renderPreviews();
+      });
+    });
   }
 
   function submitPost(){
@@ -1118,7 +1149,7 @@ const JS_STR = `
     fd.append("location", location);
     fd.append("tag", tag);
     fd.append("text", text);
-    for (var i=0;i<state.photos.length;i++) fd.append("photos", state.photos[i]);
+    for (var i=0;i<state.photos.length;i++) fd.append("photos", state.photos[i], "photo"+(i+1)+".jpg");
 
     var btn = $("postBtn");
     btn.disabled = true; btn.textContent = "Posting...";
