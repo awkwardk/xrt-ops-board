@@ -1,0 +1,21 @@
+# Render Blueprint for XRT Ops Board
+# Declares the web service and the persistent disk mounted at /data so
+# posts, team, settings, and photos survive restarts.
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: xrt-ops-board
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /ping
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+    disk:
+      name: ops-data
+      mountPath: /data
+      sizeGB: 5
