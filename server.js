@@ -628,6 +628,10 @@ header{position:sticky; top:0; z-index:20; background:#fff;
 .btn-primary:active{background:var(--green-btn);}
 .btn-text{width:100%; background:none; border:none; color:var(--text2);
   min-height:44px; font-size:15px; margin-top:6px;}
+.photo-btns{display:flex; gap:8px;}
+.photo-btn{flex:1; min-height:44px; border:1.5px solid var(--green); background:#fff;
+  color:var(--green); border-radius:10px; font-size:14px; font-weight:600;}
+.photo-btn:active{background:var(--green-light);}
 .preview-row{display:flex; gap:8px; flex-wrap:wrap; margin-top:8px;}
 .preview{position:relative; width:72px; height:72px;}
 .preview img{width:72px; height:72px; object-fit:cover; border-radius:8px;
@@ -766,7 +770,12 @@ const BODY_STR = `
     </div>
     <div class="field">
       <label>Photos (up to 3)</label>
-      <input type="file" id="in-photos" accept="image/*" multiple>
+      <div class="photo-btns">
+        <button type="button" class="photo-btn" id="takePhotoBtn">&#128247; Take Photo</button>
+        <button type="button" class="photo-btn" id="chooseFileBtn">&#128193; Choose File</button>
+      </div>
+      <input type="file" id="in-camera" accept="image/*" capture="environment" class="hidden">
+      <input type="file" id="in-photos" accept="image/*" multiple class="hidden">
       <div class="preview-row" id="previewRow"></div>
     </div>
     <button class="btn-primary" id="postBtn">Post Update</button>
@@ -1312,6 +1321,9 @@ const JS_STR = `
     $("addOverlay").addEventListener("click", function(e){ if (e.target===this) closeAdd(); });
     $("postBtn").addEventListener("click", submitPost);
     $("in-photos").addEventListener("change", onPhotoSelect);
+    $("in-camera").addEventListener("change", onPhotoSelect);
+    $("takePhotoBtn").addEventListener("click", function(){ $("in-camera").click(); });
+    $("chooseFileBtn").addEventListener("click", function(){ $("in-photos").click(); });
 
     $("lockBtn").addEventListener("click", showPin);
     $("gearBtn").addEventListener("click", openSettings);
