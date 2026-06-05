@@ -34,14 +34,21 @@ Admins: Marc, Kendall, Manuel. Admins can change both PINs from the in-app setti
 
 ## Deployment (Render free tier)
 
-- Web service, build command: _none_, start command: `node server.js`
+- Web service (Starter tier), build command: _none_, start command: `node server.js`
 - Render injects `PORT`.
-- **Data is in-memory** and resets on restart / spin-down — intentional for the testing phase.
-- Point **UptimeRobot** at `/ping` (every 5 min) to keep the free service awake.
+- **Persistent disk** mounted at `/data` (5GB). Data **survives restarts**.
+- Point **UptimeRobot** at `/ping` (every 5 min) to keep the service awake.
 
-### Upgrading to persistent storage
+### Persistent storage
 
-Data access goes through `loadData()` / `saveData()`. On the free tier `saveData()` is a no-op. When a persistent disk is mounted at `/data`, set `USE_DISK = true` near the top of `server.js` — JSON is then read from and written to `/data/ops-data/`.
+Data access goes through `loadData()` / `saveData()`. On startup the app creates `/data/ops-data/` (and `/data/ops-data/photos/`) and loads:
+
+- `/data/ops-data/posts.json` — posts (each stores photo **filenames**, not image bytes)
+- `/data/ops-data/team.json` — team members (seeded with defaults if missing)
+- `/data/ops-data/settings.json` — staff/admin PINs (defaults if missing)
+- `/data/ops-data/photos/` — uploaded image files, named `[unix-seconds]-[rand4].[ext]`
+
+`saveData()` (sync JSON writes, wrapped in try/catch) runs after every create / delete / pin / team / settings change. Set `OPS_DATA_DIR` to override the base path (the test harness points it at a temp dir).
 
 ## API
 
@@ -50,8 +57,9 @@ Data access goes through `loadData()` / `saveData()`. On the free tier `saveData
 | GET | `/` | Single-page app |
 | GET | `/ping` | `{ status: "ok" }` keepalive |
 | GET | `/api/posts?location=Cole` | Filter by location (`All` for everything); pinned first, then newest |
-| POST | `/api/posts` | `multipart/form-data`: author, location, tag, text, photos (≤3, ≤2MB each) |
-| DELETE | `/api/posts/:id` | Admin (header `X-Access-Level: admin`) |
+| POST | `/api/posts` | `multipart/form-data`: author, location, tag, text, photos (≤8, ≤3MB each, saved to disk) |
+| GET | `/api/photo/:filename` | Serves a photo file from disk (correct `Content-Type`, 404 if missing) |
+| DELETE | `/api/posts/:id` | Admin (header `X-Access-Level: admin`); also deletes the post's photo files |
 | POST | `/api/posts/:id/pin` | Admin — toggle pin |
 | GET | `/api/team` | Team list |
 | POST | `/api/team` | Admin — add member |

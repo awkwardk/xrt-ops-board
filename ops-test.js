@@ -8,12 +8,17 @@
  */
 
 const http = require('http');
+const fs = require('fs');
+const os = require('os');
 const { spawn } = require('child_process');
 const path = require('path');
 
 const serverFile = process.argv[2] || 'server.js';
 const PORT = process.env.TEST_PORT || 4555;
 const HOST = '127.0.0.1';
+
+// Hermetic data dir so tests never touch the real persistent disk.
+const TEST_DATA_DIR = path.join(os.tmpdir(), 'ops-test-data-' + process.pid);
 
 let passed = 0;
 let failed = 0;
@@ -137,12 +142,13 @@ async function run() {
 let child;
 function shutdown(code) {
   if (child) { try { child.kill(); } catch (e) {} }
+  try { fs.rmSync(TEST_DATA_DIR, { recursive: true, force: true }); } catch (e) {}
   process.exit(code);
 }
 
 console.log('Starting server: ' + serverFile + ' on port ' + PORT);
 child = spawn(process.execPath, [path.resolve(serverFile)], {
-  env: Object.assign({}, process.env, { PORT: String(PORT) }),
+  env: Object.assign({}, process.env, { PORT: String(PORT), OPS_DATA_DIR: TEST_DATA_DIR }),
   stdio: ['ignore', 'inherit', 'inherit']
 });
 child.on('error', function (err) {

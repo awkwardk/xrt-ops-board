@@ -5,9 +5,10 @@
  * Single-file Node.js app. No external packages — only built-in
  * http, https, fs, path modules.
  *
- * Deployed to Render free tier (no persistent disk). Data lives in
- * memory and resets on restart. The loadData()/saveData() pattern is
- * in place so migration to a persistent /data disk is trivial later.
+ * Deployed to Render Starter tier with a 5GB persistent disk mounted
+ * at /data. Posts, team, settings, and photos are stored on disk and
+ * survive restarts. The loadData()/saveData() pattern that was built
+ * in from the start now reads/writes JSON files under /data/ops-data/.
  */
 
 const http = require('http');
@@ -17,15 +18,17 @@ const path = require('path');
 const PORT = process.env.PORT || 3000;
 
 /* ------------------------------------------------------------------ *
- * Data layer
+ * Data layer — persistent disk storage
  *
- * On the free tier everything is in memory. DATA_DIR points at where
- * JSON files WOULD live on a persistent disk. saveData() is a no-op
- * unless USE_DISK is enabled (set when /data exists / paid tier).
+ * DATA_DIR is the persistent disk location (Render mounts the disk at
+ * /data). All data is read from / written to JSON files here, and
+ * uploaded photos are stored as files under PHOTOS_DIR. OPS_DATA_DIR
+ * can override the base path (used by the test harness so it never
+ * touches the real disk).
  * ------------------------------------------------------------------ */
 
-const DATA_DIR = path.join('/data', 'ops-data');
-const USE_DISK = false; // flip to true once a persistent disk is mounted
+const DATA_DIR = process.env.OPS_DATA_DIR || path.join('/data', 'ops-data');
+const PHOTOS_DIR = path.join(DATA_DIR, 'photos');
 
 const DEFAULT_TEAM = [
   { name: 'Marc', location: 'Cole', role: 'admin' },
@@ -60,35 +63,43 @@ function readJsonFile(file, fallback) {
 }
 
 /*
- * loadData — initialize the in-memory stores.
- * On free tier: seed from defaults. On disk tier: read JSON files,
- * falling back to defaults if they don't exist yet.
+ * loadData — read the on-disk stores into memory at startup.
+ * Creates the data + photos directories if missing, then loads each
+ * JSON file, falling back to defaults when a file is missing or
+ * corrupt. A baseline is written back so the files always exist.
  */
 function loadData() {
-  if (USE_DISK) {
-    try {
-      if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    } catch (err) {
-      console.error('[OPS] Could not create data dir:', err.message);
-    }
-    posts = readJsonFile(path.join(DATA_DIR, 'posts.json'), []);
-    team = readJsonFile(path.join(DATA_DIR, 'team.json'), DEFAULT_TEAM.slice());
-    settings = readJsonFile(path.join(DATA_DIR, 'settings.json'), Object.assign({}, DEFAULT_SETTINGS));
-  } else {
-    posts = [];
-    team = DEFAULT_TEAM.slice();
-    settings = Object.assign({}, DEFAULT_SETTINGS);
+  // 1 & 2: ensure /data/ops-data/ and /data/ops-data/photos/ exist.
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(PHOTOS_DIR)) fs.mkdirSync(PHOTOS_DIR, { recursive: true });
+  } catch (err) {
+    console.error('[OPS] Could not create data dirs:', err.message);
   }
+
+  // 3, 4, 5: load posts / team / settings with safe fallbacks.
+  posts = readJsonFile(path.join(DATA_DIR, 'posts.json'), []);
+  team = readJsonFile(path.join(DATA_DIR, 'team.json'), DEFAULT_TEAM.slice());
+  settings = readJsonFile(path.join(DATA_DIR, 'settings.json'), Object.assign({}, DEFAULT_SETTINGS));
+
+  if (!Array.isArray(posts)) posts = [];
+  if (!Array.isArray(team)) team = DEFAULT_TEAM.slice();
+  if (!settings || typeof settings !== 'object') settings = Object.assign({}, DEFAULT_SETTINGS);
+  if (!settings.staffPin) settings.staffPin = DEFAULT_SETTINGS.staffPin;
+  if (!settings.adminPin) settings.adminPin = DEFAULT_SETTINGS.adminPin;
+
+  // Persist a baseline so the JSON files exist on first run.
+  saveData();
 }
 
 /*
- * saveData — persist a given store to disk.
- * No-op on free tier. When USE_DISK is true, writes JSON files. Photos
- * are kept inline as base64 data URLs in posts.json for now; a future
- * disk upgrade can split them into files inside this same function.
+ * saveData — persist the stores to disk as JSON files. Posts store
+ * only photo filenames (the image bytes live as files under
+ * PHOTOS_DIR). Uses fs.writeFileSync and is wrapped in try/catch so a
+ * write failure logs but never crashes the server. Called after every
+ * create / delete / pin / team / settings change.
  */
 function saveData(which) {
-  if (!USE_DISK) return; // free tier: in-memory only
   try {
     if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
     if (!which || which === 'posts') {
@@ -164,20 +175,54 @@ function readBody(req, maxBytes, cb) {
 /* ------------------------------------------------------------------ *
  * Manual multipart/form-data parser
  *
- * Returns { fields: {}, photos: [] } where photos are base64 data URL
- * strings. Pure Buffer work — no external packages.
+ * Returns { fields: {}, photos: [] } where photos are FILENAMES of
+ * images saved to PHOTOS_DIR on disk. Pure Buffer work — no external
+ * packages.
  * ------------------------------------------------------------------ */
 
-const MAX_PHOTO_BYTES = 2 * 1024 * 1024; // 2MB per photo
-const MAX_PHOTOS = 3;
+const MAX_PHOTO_BYTES = 3 * 1024 * 1024; // 3MB per photo (before compression)
+const MAX_PHOTOS = 8;
 
 function mimeFromFilename(name) {
-  const ext = (name.split('.').pop() || '').toLowerCase();
+  const ext = (String(name).split('.').pop() || '').toLowerCase();
   if (ext === 'png') return 'image/png';
   if (ext === 'gif') return 'image/gif';
   if (ext === 'webp') return 'image/webp';
   if (ext === 'heic') return 'image/heic';
   return 'image/jpeg';
+}
+
+/* Pick a file extension from a mime type (falling back to the name). */
+function extFromMime(mime, fallbackName) {
+  if (mime === 'image/png') return 'png';
+  if (mime === 'image/gif') return 'gif';
+  if (mime === 'image/webp') return 'webp';
+  if (mime === 'image/heic') return 'heic';
+  if (mime === 'image/jpeg') return 'jpg';
+  const ext = (String(fallbackName).split('.').pop() || '').toLowerCase();
+  if (ext === 'jpeg') return 'jpg';
+  if (['png', 'gif', 'webp', 'heic', 'jpg'].indexOf(ext) !== -1) return ext;
+  return 'jpg';
+}
+
+/*
+ * Write image bytes to PHOTOS_DIR and return the bare filename.
+ * Filename format: [unix-seconds]-[random4digits].[ext]
+ * e.g. 1780669800-4821.jpg  — retried if it would collide.
+ */
+function savePhotoFile(buffer, mime, originalName) {
+  const ext = extFromMime(mime, originalName);
+  let filename;
+  let attempts = 0;
+  do {
+    const ts = Math.floor(Date.now() / 1000);
+    const rand = Math.floor(1000 + Math.random() * 9000);
+    filename = ts + '-' + rand + '.' + ext;
+    attempts++;
+  } while (fs.existsSync(path.join(PHOTOS_DIR, filename)) && attempts < 20);
+  if (!fs.existsSync(PHOTOS_DIR)) fs.mkdirSync(PHOTOS_DIR, { recursive: true });
+  fs.writeFileSync(path.join(PHOTOS_DIR, filename), buffer);
+  return filename;
 }
 
 function parseMultipart(buffer, contentType) {
@@ -228,8 +273,13 @@ function parseMultipart(buffer, contentType) {
       const ctMatch = /content-type:\s*([^\r\n]+)/i.exec(headerStr);
       let mime = ctMatch ? ctMatch[1].trim() : mimeFromFilename(fileMatch[1]);
       if (mime.indexOf('image/') !== 0) mime = mimeFromFilename(fileMatch[1]);
-      const dataUrl = 'data:' + mime + ';base64,' + content.toString('base64');
-      result.photos.push(dataUrl);
+      // Save the image bytes to disk; store only the filename.
+      try {
+        const saved = savePhotoFile(content, mime, fileMatch[1]);
+        result.photos.push(saved);
+      } catch (e) {
+        console.error('[OPS] Failed to save photo:', e.message);
+      }
     } else if (fieldName) {
       result.fields[fieldName] = content.toString('utf8');
     }
@@ -259,10 +309,35 @@ function handleGetPosts(req, res, query) {
   sendJson(res, 200, sortPosts(list));
 }
 
+/*
+ * Serve a photo file from PHOTOS_DIR. Content-Type is derived from the
+ * file extension. Returns 404 if the file does not exist. The filename
+ * is reduced to its basename to prevent path traversal.
+ */
+function handleGetPhoto(req, res, filename) {
+  try {
+    const safe = path.basename(decodeURIComponent(filename));
+    const file = path.join(PHOTOS_DIR, safe);
+    if (!safe || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
+      return sendJson(res, 404, { success: false, error: 'Photo not found' });
+    }
+    const data = fs.readFileSync(file);
+    res.writeHead(200, {
+      'Content-Type': mimeFromFilename(safe),
+      'Content-Length': data.length,
+      'Cache-Control': 'public, max-age=31536000, immutable'
+    });
+    res.end(data);
+  } catch (err) {
+    console.error('[OPS] photo serve error:', err.message);
+    sendJson(res, 404, { success: false, error: 'Photo not found' });
+  }
+}
+
 function handleCreatePost(req, res) {
   const ct = req.headers['content-type'] || '';
-  // Body cap: 3 photos * 2MB + base64 overhead + fields ≈ generous 12MB.
-  readBody(req, 12 * 1024 * 1024, function (err, buf) {
+  // Body cap: 8 photos * 3MB + multipart overhead + fields ≈ generous 32MB.
+  readBody(req, 32 * 1024 * 1024, function (err, buf) {
     if (err) return sendJson(res, 413, { success: false, error: err.message });
     try {
       let fields = {};
@@ -318,6 +393,20 @@ function handleDeletePost(req, res, id) {
   if (!isAdmin(req)) return sendJson(res, 403, { success: false, error: 'Admin only' });
   const idx = posts.findIndex(function (p) { return p.id === id; });
   if (idx === -1) return sendJson(res, 404, { success: false, error: 'Not found' });
+  const removed = posts[idx];
+  // Delete associated photo files from disk.
+  if (removed && Array.isArray(removed.photos)) {
+    removed.photos.forEach(function (fn) {
+      try {
+        const safe = path.basename(String(fn));
+        const file = path.join(PHOTOS_DIR, safe);
+        if (fs.existsSync(file)) fs.unlinkSync(file);
+      } catch (e) {
+        console.error('[OPS] Failed to delete photo ' + fn + ':', e.message);
+      }
+    });
+    removed.photos = [];
+  }
   posts.splice(idx, 1);
   saveData('posts');
   sendJson(res, 200, { success: true });
@@ -464,6 +553,9 @@ const server = http.createServer(function (req, res) {
       if (method === 'POST') return handleCreatePost(req, res);
     }
     let m;
+    if ((m = /^\/api\/photo\/([^/]+)$/.exec(pathname)) && (method === 'GET' || method === 'HEAD')) {
+      return handleGetPhoto(req, res, m[1]);
+    }
     if ((m = /^\/api\/posts\/([^/]+)\/pin$/.exec(pathname)) && method === 'POST') {
       return handlePinPost(req, res, m[1]);
     }
@@ -780,7 +872,7 @@ const BODY_STR = `
       <div class="err">Update text is required</div>
     </div>
     <div class="field">
-      <label>Photos (up to 3)</label>
+      <label>Photos (up to 8)</label>
       <div class="photo-btns">
         <button type="button" class="photo-btn" id="takePhotoBtn">&#128247; Take Photo</button>
         <button type="button" class="photo-btn" id="chooseFileBtn">&#128193; Choose File</button>
@@ -986,7 +1078,8 @@ const JS_STR = `
     if (p.photos && p.photos.length){
       photos = '<div class="photos">';
       for (var k=0;k<p.photos.length;k++){
-        photos += '<img src="'+p.photos[k]+'" data-full="'+p.photos[k]+'" alt="photo">';
+        var purl = "/api/photo/" + encodeURIComponent(p.photos[k]);
+        photos += '<img src="'+purl+'" data-full="'+purl+'" alt="photo">';
       }
       photos += '</div>';
     }
@@ -1102,14 +1195,14 @@ const JS_STR = `
     });
   }
 
-  // Compress an image File to <=800px on the longest side, JPEG q0.75.
+  // Compress an image File to <=1200px on the longest side, JPEG q0.85.
   // Falls back to the original file if anything goes wrong.
   function compressPhoto(file, cb){
     try {
       var url = URL.createObjectURL(file);
       var img = new Image();
       img.onload = function(){
-        var max = 800;
+        var max = 1200;
         var w = img.width, h = img.height;
         if (w >= h && w > max){ h = Math.round(h * max / w); w = max; }
         else if (h > w && h > max){ w = Math.round(w * max / h); h = max; }
@@ -1119,7 +1212,7 @@ const JS_STR = `
         ctx.drawImage(img, 0, 0, w, h);
         URL.revokeObjectURL(url);
         if (canvas.toBlob){
-          canvas.toBlob(function(blob){ cb(blob || file); }, "image/jpeg", 0.75);
+          canvas.toBlob(function(blob){ cb(blob || file); }, "image/jpeg", 0.85);
         } else {
           cb(file);
         }
@@ -1141,16 +1234,16 @@ const JS_STR = `
       return f.type.indexOf("image/") === 0;
     });
     e.target.value = "";
-    var capacity = Math.max(0, 3 - state.photos.length);
+    var capacity = Math.max(0, 8 - state.photos.length);
     if (files.length > capacity){
       var dropped = files.length - capacity;
-      showPhotoMsg("Max 3 photos \\u2014 " + dropped + " not added.");
+      showPhotoMsg("Max 8 photos \\u2014 " + dropped + " not added.");
     } else {
       hidePhotoMsg();
     }
     files.forEach(function(file){
       compressPhoto(file, function(blob){
-        if (state.photos.length >= 3) return; // 3 total across both inputs
+        if (state.photos.length >= 8) return; // 8 total across both inputs
         state.photos.push(blob);
         renderPreviews();
       });
@@ -1418,10 +1511,12 @@ const JS_STR = `
  * Boot
  * ------------------------------------------------------------------ */
 
-loadData();
 console.log('[OPS] Server starting...');
+console.log('[OPS] Storage: persistent disk at ' + DATA_DIR);
+loadData();
+console.log('[OPS] Photos directory: ' + PHOTOS_DIR);
 console.log('[OPS] Team initialized: ' + team.length + ' members');
-console.log('[OPS] Posts initialized: ' + posts.length);
+console.log('[OPS] Posts loaded: ' + posts.length);
 server.listen(PORT, function () {
   console.log('[OPS] Running on port ' + PORT);
   console.log('[OPS] Ready — visit /ping to verify');
