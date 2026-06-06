@@ -300,12 +300,26 @@ function sortPosts(list) {
 }
 
 function handleGetPosts(req, res, query) {
-  let list = posts;
   const loc = query.location;
+  const admin = isAdmin(req);
+
+  // Management feed is admin-only. Staff (or anyone without the admin
+  // header) get an empty array — management posts are never exposed.
+  if (loc === 'Management') {
+    if (!admin) return sendJson(res, 200, []);
+    return sendJson(res, 200, sortPosts(
+      posts.filter(function (p) { return p.location === 'Management'; })
+    ));
+  }
+
+  let list = posts;
   if (loc && loc !== 'All') {
     // Posts tagged "All" appear under every location filter.
     list = posts.filter(function (p) { return p.location === loc || p.location === 'All'; });
   }
+  // Never include Management posts in any non-Management query (this
+  // also keeps them out of the location=All feed that staff load).
+  list = list.filter(function (p) { return p.location !== 'Management'; });
   sendJson(res, 200, sortPosts(list));
 }
 
@@ -365,6 +379,10 @@ function handleCreatePost(req, res) {
       const validTags = ['urgent', 'info', 'success', 'warning'];
       if (validTags.indexOf(tag) === -1) {
         return sendJson(res, 400, { success: false, error: 'Invalid category' });
+      }
+      // Posting to the Management feed is admin-only.
+      if (location === 'Management' && !isAdmin(req)) {
+        return sendJson(res, 403, { success: false, error: 'Unauthorized' });
       }
 
       const now = new Date();
@@ -966,6 +984,7 @@ const JS_STR = `
     location: "Cole",
     team: [],
     posts: [],
+    mgmtPosts: [],     // admin-only Management feed (kept separate)
     photos: [],        // selected File objects for new post
     pendingDelete: null,
     pinLevel: null,
@@ -1012,13 +1031,35 @@ const JS_STR = `
     $("lockLabel").textContent = isAdmin() ? "Admin" : "Staff";
     if (isAdmin()) $("gearBtn").classList.remove("hidden");
     else $("gearBtn").classList.add("hidden");
+    ensureMgmtOption();
+  }
+
+  // Add/remove the "Management" choice in the Location dropdown so it
+  // exists only for admins (staff never see it as an option).
+  function ensureMgmtOption(){
+    var sel = $("in-location");
+    if (!sel) return;
+    var existing = sel.querySelector('option[value="Management"]');
+    if (isAdmin()){
+      if (!existing){
+        var opt = document.createElement("option");
+        opt.value = "Management"; opt.textContent = "Management";
+        sel.appendChild(opt);
+      }
+    } else if (existing){
+      existing.parentNode.removeChild(existing);
+    }
   }
 
   /* ---------- Tabs ---------- */
   function renderTabs(){
+    // Management is the last tab and is rendered for admins only — it
+    // is entirely absent from the DOM for staff.
+    var locs = LOCATIONS.slice();
+    if (isAdmin()) locs.push("Management");
     var html = "";
-    for (var i=0;i<LOCATIONS.length;i++){
-      var loc = LOCATIONS[i];
+    for (var i=0;i<locs.length;i++){
+      var loc = locs[i];
       var cls = "tab" + (loc===state.location ? " active" : "");
       html += '<button class="'+cls+'" data-loc="'+loc+'">'+loc+'</button>';
     }
@@ -1035,9 +1076,14 @@ const JS_STR = `
   /* ---------- Stats ---------- */
   function renderStats(){
     var loc = state.location;
-    var todays = state.posts.filter(function(p){
-      return (loc==="All" || p.location===loc || p.location==="All") && isToday(p.timestamp);
-    });
+    var todays;
+    if (loc === "Management"){
+      todays = state.mgmtPosts.filter(function(p){ return isToday(p.timestamp); });
+    } else {
+      todays = state.posts.filter(function(p){
+        return (loc==="All" || p.location===loc || p.location==="All") && isToday(p.timestamp);
+      });
+    }
     var urgent = todays.filter(function(p){ return p.tag==="urgent"; }).length;
     var done = todays.filter(function(p){ return p.tag==="success"; }).length;
     $("stats").innerHTML =
@@ -1052,9 +1098,18 @@ const JS_STR = `
   /* ---------- Feed ---------- */
   function renderFeed(){
     var loc = state.location;
-    var list = state.posts.filter(function(p){ return loc==="All" || p.location===loc || p.location==="All"; });
+    var list;
+    if (loc === "Management"){
+      list = state.mgmtPosts.filter(function(p){ return p.location === "Management"; });
+    } else {
+      list = state.posts.filter(function(p){ return loc==="All" || p.location===loc || p.location==="All"; });
+    }
     if (!list.length){
-      $("feed").innerHTML = '<div class="empty">No updates for '+esc(loc)+' yet.<br>Tap + to post one.</div>';
+      if (loc === "Management"){
+        $("feed").innerHTML = '<div class="empty">No management notes yet. Tap + to add one.</div>';
+      } else {
+        $("feed").innerHTML = '<div class="empty">No updates for '+esc(loc)+' yet.<br>Tap + to post one.</div>';
+      }
       return;
     }
     var html = "";
@@ -1141,9 +1196,19 @@ const JS_STR = `
       .then(function(r){ return r.json(); })
       .then(function(list){
         state.posts = Array.isArray(list) ? list : [];
-        renderStats(); renderFeed();
+        return loadMgmtPosts();
       })
+      .then(function(){ renderStats(); renderFeed(); })
       .catch(function(){});
+  }
+  // Management posts are admin-only and kept separate from state.posts
+  // so they never appear in any location tab.
+  function loadMgmtPosts(){
+    if (!isAdmin()){ state.mgmtPosts = []; return Promise.resolve(); }
+    return fetch("/api/posts?location=Management", { headers: headers(false) })
+      .then(function(r){ return r.json(); })
+      .then(function(list){ state.mgmtPosts = Array.isArray(list) ? list : []; })
+      .catch(function(){ state.mgmtPosts = []; });
   }
   function loadTeam(){
     return fetch("/api/team")
@@ -1167,6 +1232,11 @@ const JS_STR = `
   function openAdd(){
     clearErrors();
     hidePhotoMsg();
+    // Pre-select Management in the Location dropdown when that tab is active.
+    if (state.location === "Management" && isAdmin()){
+      ensureMgmtOption();
+      $("in-location").value = "Management";
+    }
     $("addOverlay").classList.add("show");
   }
   function closeAdd(){
