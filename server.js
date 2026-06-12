@@ -59,11 +59,36 @@ const DEFAULT_SUPPLIES = {
   flags: []
 };
 
+/*
+ * SOP (Standard Operating Procedure) documents. Each: title, category,
+ * optional sopId, content body, last-updated date. Two placeholders are
+ * pre-loaded on first run (when no sops.json exists yet).
+ */
+const DEFAULT_SOPS = [
+  {
+    id: 'sop-1',
+    sopId: 'SOP-001',
+    title: 'Electronics Intake Procedure',
+    category: 'Intake',
+    body: 'Purpose: Ensure all incoming electronics are properly received, logged, and staged for processing.\n\nStep 1: Greet the customer and confirm they have a valid pickup or drop-off appointment.\n\nStep 2: Count and record the number of items being dropped off. Note any oversized or hazardous items (CRT monitors, batteries, large printers).\n\nStep 3: Issue the customer a receipt with item count and date. Have them sign if required by location.\n\nStep 4: Stage items in the designated intake area — do not mix with already-processed inventory.\n\nStep 5: Tag the lot with date received and customer reference number if applicable.\n\nStep 6: Notify the processing team that a new intake is staged and ready.\n\nNotes:\n- Never accept items that are leaking, smoking, or show signs of chemical damage\n- Batteries must be placed in the designated battery bin immediately\n- If unsure about an item, ask a supervisor before accepting',
+    updated: '2026-06-12'
+  },
+  {
+    id: 'sop-2',
+    sopId: 'SOP-002',
+    title: 'Hard Drive Data Destruction',
+    category: 'Data Destruction',
+    body: 'Purpose: Ensure all data-bearing devices are destroyed completely and documented correctly. This SOP has zero tolerance for errors.\n\nStep 1: Identify all data-bearing devices in the lot — hard drives, SSDs, phones, tablets, laptops.\n\nStep 2: Log each device by make, model, and serial number before destruction.\n\nStep 3: Process each device through the approved destruction method for its type:\n- Hard drives: physical shredding or degaussing\n- SSDs and flash storage: physical shredding only (degaussing does not work)\n- Phones and tablets: physical shredding\n\nStep 4: Document destruction completion — note date, time, method, and staff member who performed it.\n\nStep 5: Generate certificate of destruction for the customer if requested.\n\nStep 6: Place destroyed material in the certified destruction bin — do not mix with general e-scrap.\n\nNotes:\n- Never skip logging a device — documentation is legally required\n- If a device cannot be processed immediately, store it in the locked staging area\n- Questions about a specific device type go to the supervisor before proceeding',
+    updated: '2026-06-12'
+  }
+];
+
 // In-memory stores
 let posts = [];
 let team = [];
 let settings = {};
 let supplies = { items: [], flags: [] };
+let sops = [];
 
 /* Read a JSON file from disk, returning fallback on any problem. */
 function readJsonFile(file, fallback) {
@@ -97,6 +122,7 @@ function loadData() {
   team = readJsonFile(path.join(DATA_DIR, 'team.json'), DEFAULT_TEAM.slice());
   settings = readJsonFile(path.join(DATA_DIR, 'settings.json'), Object.assign({}, DEFAULT_SETTINGS));
   supplies = readJsonFile(path.join(DATA_DIR, 'supplies.json'), null);
+  sops = readJsonFile(path.join(DATA_DIR, 'sops.json'), null);
 
   if (!Array.isArray(posts)) posts = [];
   if (!Array.isArray(team)) team = DEFAULT_TEAM.slice();
@@ -107,6 +133,9 @@ function loadData() {
       !Array.isArray(supplies.items) || !Array.isArray(supplies.flags)) {
     supplies = JSON.parse(JSON.stringify(DEFAULT_SUPPLIES));
   }
+  // Missing/corrupt sops.json -> pre-load the two placeholders. An
+  // empty array is a valid state (admin removed all) and is kept.
+  if (!Array.isArray(sops)) sops = JSON.parse(JSON.stringify(DEFAULT_SOPS));
 
   // Persist a baseline so the JSON files exist on first run.
   saveData();
@@ -133,6 +162,9 @@ function saveData(which) {
     }
     if (!which || which === 'supplies') {
       fs.writeFileSync(path.join(DATA_DIR, 'supplies.json'), JSON.stringify(supplies, null, 2));
+    }
+    if (!which || which === 'sops') {
+      fs.writeFileSync(path.join(DATA_DIR, 'sops.json'), JSON.stringify(sops, null, 2));
     }
   } catch (err) {
     console.error('[OPS] saveData failed:', err.message);
@@ -671,6 +703,83 @@ function handleDeleteSupplyItem(req, res, id) {
 }
 
 /* ------------------------------------------------------------------ *
+ * SOP (Standard Operating Procedure) handlers
+ *
+ * Stored on disk in sops.json. Reading is open (staff search/read
+ * without a PIN); create/update/delete require X-Access-Level: admin,
+ * gated by the existing admin PIN like every other admin action.
+ * ------------------------------------------------------------------ */
+
+function handleGetSops(req, res) {
+  sendJson(res, 200, sops);
+}
+
+function handleCreateSop(req, res) {
+  if (!isAdmin(req)) return sendJson(res, 403, { success: false, error: 'Admin only' });
+  readBody(req, 256 * 1024, function (err, buf) {
+    if (err) return sendJson(res, 400, { success: false, error: err.message });
+    try {
+      const body = JSON.parse(buf.toString('utf8') || '{}');
+      const title = String(body.title || '').trim();
+      const category = String(body.category || 'General').trim() || 'General';
+      const sopId = String(body.sopId || '').trim();
+      const content = String(body.body || '').trim();
+      if (!title) return sendJson(res, 400, { success: false, error: 'Title required' });
+      if (!content) return sendJson(res, 400, { success: false, error: 'Content required' });
+      const sop = {
+        id: 'sop-' + Date.now() + '-' + Math.floor(Math.random() * 10000),
+        sopId: sopId,
+        title: title,
+        category: category,
+        body: content,
+        updated: new Date().toISOString().slice(0, 10)
+      };
+      sops.push(sop);
+      saveData('sops');
+      sendJson(res, 200, { success: true, sop: sop });
+    } catch (e) {
+      sendJson(res, 500, { success: false, error: 'Could not create SOP' });
+    }
+  });
+}
+
+function handleUpdateSop(req, res, id) {
+  if (!isAdmin(req)) return sendJson(res, 403, { success: false, error: 'Admin only' });
+  readBody(req, 256 * 1024, function (err, buf) {
+    if (err) return sendJson(res, 400, { success: false, error: err.message });
+    try {
+      const target = decodeURIComponent(id);
+      const sop = sops.find(function (s) { return s.id === target; });
+      if (!sop) return sendJson(res, 404, { success: false, error: 'Not found' });
+      const body = JSON.parse(buf.toString('utf8') || '{}');
+      const title = String(body.title || '').trim();
+      const content = String(body.body || '').trim();
+      if (!title) return sendJson(res, 400, { success: false, error: 'Title required' });
+      if (!content) return sendJson(res, 400, { success: false, error: 'Content required' });
+      sop.title = title;
+      sop.category = String(body.category || sop.category).trim() || sop.category;
+      sop.sopId = String(body.sopId || '').trim();
+      sop.body = content;
+      sop.updated = new Date().toISOString().slice(0, 10);
+      saveData('sops');
+      sendJson(res, 200, { success: true, sop: sop });
+    } catch (e) {
+      sendJson(res, 500, { success: false, error: 'Could not update SOP' });
+    }
+  });
+}
+
+function handleDeleteSop(req, res, id) {
+  if (!isAdmin(req)) return sendJson(res, 403, { success: false, error: 'Admin only' });
+  const target = decodeURIComponent(id);
+  const before = sops.length;
+  sops = sops.filter(function (s) { return s.id !== target; });
+  if (sops.length === before) return sendJson(res, 404, { success: false, error: 'Not found' });
+  saveData('sops');
+  sendJson(res, 200, { success: true });
+}
+
+/* ------------------------------------------------------------------ *
  * Router
  * ------------------------------------------------------------------ */
 
@@ -746,6 +855,20 @@ const server = http.createServer(function (req, res) {
     }
     if ((m = /^\/api\/supplies\/items\/([^/]+)$/.exec(pathname)) && method === 'DELETE') {
       return handleDeleteSupplyItem(req, res, m[1]);
+    }
+
+    // SOPs
+    if (pathname === '/api/sops' && method === 'GET') {
+      return handleGetSops(req, res);
+    }
+    if (pathname === '/api/sops' && method === 'POST') {
+      return handleCreateSop(req, res);
+    }
+    if ((m = /^\/api\/sops\/([^/]+)$/.exec(pathname)) && method === 'PUT') {
+      return handleUpdateSop(req, res, m[1]);
+    }
+    if ((m = /^\/api\/sops\/([^/]+)$/.exec(pathname)) && method === 'DELETE') {
+      return handleDeleteSop(req, res, m[1]);
     }
 
     sendJson(res, 404, { success: false, error: 'Not found' });
@@ -1026,6 +1149,63 @@ header{position:sticky; top:0; z-index:20; background:#fff;
   border-radius:20px; opacity:0; transition:opacity .2s; pointer-events:none; z-index:100;}
 .sup-toast.show{opacity:1;}
 
+/* SOPs tab */
+#sops{padding:0 12px;}
+.sop-toggle{display:flex; gap:8px; margin-bottom:10px;}
+.sop-search-wrap{position:relative; margin-bottom:10px;}
+.sop-search{width:100%; padding:12px 14px 12px 38px; border:1.5px solid var(--border);
+  border-radius:10px; font-size:15px; font-family:inherit; background:#fff; color:var(--text);}
+.sop-search:focus{outline:none; border-color:var(--green);}
+.sop-search-icon{position:absolute; left:12px; top:50%; transform:translateY(-50%);
+  color:var(--text2); pointer-events:none;}
+.sop-cat-bar{display:flex; gap:6px; flex-wrap:wrap; margin-bottom:12px;}
+.sop-cat-btn{background:#fff; border:1.5px solid var(--green); color:var(--green);
+  border-radius:16px; padding:6px 12px; font-size:12px; font-weight:600; white-space:nowrap;
+  min-height:32px;}
+.sop-cat-btn.active{background:var(--green); color:#fff;}
+.sop-list{display:flex; flex-direction:column; gap:8px;}
+.sop-card{background:#fff; border:1px solid var(--border); border-radius:12px;
+  padding:12px 14px; cursor:pointer;}
+.sop-card:active{border-color:var(--green);}
+.sop-card-head{display:flex; align-items:flex-start; gap:10px;}
+.sop-card-title{flex:1; font-size:14px; font-weight:600; color:var(--text); line-height:1.3;}
+.sop-chev{color:var(--text2); flex-shrink:0; margin-top:2px;}
+.sop-card-meta{display:flex; align-items:center; gap:8px; margin-top:6px;}
+.sop-badge{font-size:10px; font-weight:700; padding:3px 9px; border-radius:10px;
+  background:var(--green-light); color:var(--green); text-transform:uppercase; letter-spacing:.3px;}
+.sop-idtag{font-size:11px; color:var(--text2);}
+.sop-preview{font-size:13px; color:var(--text2); margin-top:6px; line-height:1.5;
+  display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;}
+.sop-highlight{background:var(--green-light); color:var(--green); border-radius:2px; padding:0 2px;}
+.sop-empty{text-align:center; color:var(--text2); padding:28px 16px; font-size:14px;}
+.sop-back{background:none; border:none; color:var(--green); font-size:14px; font-weight:600;
+  cursor:pointer; padding:6px 0; margin-bottom:8px; display:flex; align-items:center; gap:6px;
+  min-height:40px;}
+.sop-detail-title{font-size:20px; font-weight:700; margin-bottom:6px; line-height:1.3; color:var(--text);}
+.sop-detail-meta{display:flex; align-items:center; gap:10px; margin-bottom:14px; flex-wrap:wrap;}
+.sop-detail-body{font-size:14px; color:var(--text); line-height:1.8; white-space:pre-wrap;
+  word-break:break-word;}
+.sop-updated{font-size:11px; color:var(--text2);}
+.sop-arow{background:#fff; border:1px solid var(--border); border-radius:10px;
+  padding:12px 14px; display:flex; align-items:center; gap:10px; margin-bottom:8px;}
+.sop-arow-name{flex:1; font-size:14px; font-weight:600;}
+.sop-arow-cat{font-size:12px; color:var(--text2); margin-top:2px;}
+.sop-act{border:1.5px solid var(--border); background:#fff; color:var(--text2);
+  border-radius:8px; min-height:36px; padding:6px 12px; font-size:12px; font-weight:600;}
+.sop-act.edit{border-color:var(--green); color:var(--green);}
+.sop-act.del{border-color:var(--urgent); color:var(--urgent);}
+.sop-field{margin-bottom:12px;}
+.sop-field label{display:block; font-size:13px; font-weight:600; margin-bottom:5px;}
+.sop-field input,.sop-field select,.sop-field textarea{width:100%; padding:10px 12px;
+  border:1.5px solid var(--border); border-radius:10px; font-size:15px; font-family:inherit;
+  background:#fff; color:var(--text);}
+.sop-field textarea{min-height:200px; resize:vertical; line-height:1.6;}
+.sop-form-actions{display:flex; gap:8px; margin-top:8px;}
+.sop-save{flex:1; background:var(--green); color:#fff; border:none; border-radius:10px;
+  min-height:46px; font-size:15px; font-weight:700;}
+.sop-cancel{flex:1; background:#fff; color:var(--text2); border:1.5px solid var(--border);
+  border-radius:10px; min-height:46px; font-size:15px; font-weight:600;}
+
 /* Lightbox */
 .lightbox{position:fixed; inset:0; background:rgba(0,0,0,.95); z-index:80;
   display:flex; align-items:center; justify-content:center;
@@ -1065,6 +1245,7 @@ const BODY_STR = `
   <div class="stats" id="stats"></div>
   <div class="feed" id="feed"></div>
   <div id="supplies" class="hidden"></div>
+  <div id="sops" class="hidden"></div>
 
   <button class="fab" id="fab" title="Add update">+</button>
 </div>
@@ -1206,9 +1387,17 @@ const JS_STR = `
     pinDigits: "",
     supLocation: "Cole",          // staff supplies location selector
     supData: { items: [], flags: [] },
-    supTab: "flagged"             // admin supplies sub-tab
+    supTab: "flagged",            // admin supplies sub-tab
+    sops: [],                     // SOP documents
+    sopQuery: "",                 // SOP search text
+    sopCat: "All",                // SOP category filter
+    sopDetailId: null,            // open SOP detail
+    sopAdminMode: false,          // admin manage vs browse
+    sopAdminTab: "list",          // admin SOP sub-tab: list | add
+    sopEditId: ""                 // SOP being edited
   };
   var SUP_LOCS = ["Cole","Dayton","Visalia"];
+  var SOP_CATEGORIES = ["All","Intake","Processing","Data Destruction","Safety","Customer Pickup","Sorting & Grading","Shipping & Fulfillment","Equipment","Compliance","General"];
 
   function $(id){ return document.getElementById(id); }
   function esc(s){
@@ -1272,10 +1461,11 @@ const JS_STR = `
 
   /* ---------- Tabs ---------- */
   function renderTabs(){
-    // Management is admin-only; Supplies is the final tab for everyone.
+    // Management is admin-only; Supplies and SOPs are for everyone.
     var locs = LOCATIONS.slice();
     if (isAdmin()) locs.push("Management");
     locs.push("Supplies");
+    locs.push("SOPs");
     var html = "";
     for (var i=0;i<locs.length;i++){
       var loc = locs[i];
@@ -1290,6 +1480,8 @@ const JS_STR = `
         renderTabs();
         if (state.location === "Supplies"){
           showSuppliesView();
+        } else if (state.location === "SOPs"){
+          showSopsView();
         } else {
           showFeedView();
           renderStats(); renderFeed();
@@ -1298,16 +1490,27 @@ const JS_STR = `
     }
   }
 
-  // Toggle between the normal posts view and the supplies view.
+  // Toggle between the normal posts view and the special tab views.
   function showSuppliesView(){
     $("stats").classList.add("hidden");
     $("feed").classList.add("hidden");
     $("fab").classList.add("hidden");
+    $("sops").classList.add("hidden");
     $("supplies").classList.remove("hidden");
     loadSupplies();
   }
+  function showSopsView(){
+    $("stats").classList.add("hidden");
+    $("feed").classList.add("hidden");
+    $("fab").classList.add("hidden");
+    $("supplies").classList.add("hidden");
+    $("sops").classList.remove("hidden");
+    state.sopDetailId = null;
+    loadSops();
+  }
   function showFeedView(){
     $("supplies").classList.add("hidden");
+    $("sops").classList.add("hidden");
     $("stats").classList.remove("hidden");
     $("feed").classList.remove("hidden");
     $("fab").classList.remove("hidden");
@@ -1943,6 +2146,258 @@ const JS_STR = `
       .catch(function(){ supToast("Network error"); });
   }
 
+  /* ---------- SOPs ---------- */
+  function loadSops(){
+    fetch("/api/sops")
+      .then(function(r){ return r.json(); })
+      .then(function(list){
+        state.sops = Array.isArray(list) ? list : [];
+        renderSops();
+      })
+      .catch(function(){ renderSops(); });
+  }
+  function sopHighlight(text, q){
+    var safe = esc(text);
+    if (!q) return safe;
+    var pat = q.replace(/[.*+?^\${}()|[\\]\\\\]/g, "\\\\$&");
+    try {
+      var re = new RegExp("("+pat+")", "gi");
+      return safe.replace(re, '<span class="sop-highlight">$1</span>');
+    } catch (e){ return safe; }
+  }
+  function renderSops(){
+    if (state.sopDetailId){ renderSopDetail(); return; }
+    if (isAdmin() && state.sopAdminMode){ renderSopAdmin(); return; }
+    renderSopBrowse();
+  }
+
+  /* Browse view — open to all: search, category filter, read. */
+  function renderSopBrowse(){
+    var toggle = "";
+    if (isAdmin()){
+      toggle = '<div class="sop-toggle">'+
+        '<button class="sup-pill active" data-sopmode="browse">Browse SOPs</button>'+
+        '<button class="sup-pill" data-sopmode="manage">Manage SOPs</button></div>';
+    }
+    var cats = "";
+    for (var i=0;i<SOP_CATEGORIES.length;i++){
+      var c = SOP_CATEGORIES[i];
+      cats += '<button class="sop-cat-btn'+(c===state.sopCat?" active":"")+'" data-sopcat="'+esc(c)+'">'+esc(c)+'</button>';
+    }
+    $("sops").innerHTML = toggle +
+      '<div class="sop-search-wrap">'+
+        '<svg class="sop-search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>'+
+        '<input type="text" class="sop-search" id="sopSearch" placeholder="Search SOPs by keyword...">'+
+      '</div>'+
+      '<div class="sop-cat-bar" id="sopCatBar">'+cats+'</div>'+
+      '<div class="sop-list" id="sopList"></div>'+
+      '<div class="sop-empty" id="sopEmpty" style="display:none">No SOPs found. Try a different search or category.</div>';
+    var input = $("sopSearch");
+    input.value = state.sopQuery;
+    input.addEventListener("input", function(){ state.sopQuery = this.value; renderSopList(); });
+    var modes = $("sops").querySelectorAll("[data-sopmode]");
+    for (var mi=0;mi<modes.length;mi++){
+      modes[mi].addEventListener("click", function(){
+        state.sopAdminMode = (this.getAttribute("data-sopmode") === "manage");
+        renderSops();
+      });
+    }
+    var catBtns = $("sops").querySelectorAll("[data-sopcat]");
+    for (var k=0;k<catBtns.length;k++){
+      catBtns[k].addEventListener("click", function(){
+        state.sopCat = this.getAttribute("data-sopcat");
+        var all = $("sops").querySelectorAll(".sop-cat-btn");
+        for (var z=0;z<all.length;z++) all[z].classList.remove("active");
+        this.classList.add("active");
+        renderSopList();
+      });
+    }
+    renderSopList();
+  }
+
+  /* Only re-renders the result list (keeps search input focus). */
+  function renderSopList(){
+    var list = $("sopList"), empty = $("sopEmpty");
+    if (!list) return;
+    var q = (state.sopQuery || "").trim().toLowerCase();
+    var filtered = state.sops.filter(function(s){
+      var catMatch = state.sopCat === "All" || s.category === state.sopCat;
+      var sm = !q ||
+        (s.title && s.title.toLowerCase().indexOf(q) !== -1) ||
+        (s.body && s.body.toLowerCase().indexOf(q) !== -1) ||
+        (s.sopId && s.sopId.toLowerCase().indexOf(q) !== -1) ||
+        (s.category && s.category.toLowerCase().indexOf(q) !== -1);
+      return catMatch && sm;
+    });
+    if (!filtered.length){ list.innerHTML = ""; if (empty) empty.style.display = "block"; return; }
+    if (empty) empty.style.display = "none";
+    var html = "";
+    for (var i=0;i<filtered.length;i++){
+      var s = filtered[i];
+      var b = s.body || "";
+      var preview = b.substring(0,120) + (b.length > 120 ? "..." : "");
+      html += '<div class="sop-card" data-sopopen="'+esc(s.id)+'">'+
+        '<div class="sop-card-head">'+
+          '<div class="sop-card-title">'+sopHighlight(s.title, q)+'</div>'+
+          '<svg class="sop-chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>'+
+        '</div>'+
+        '<div class="sop-card-meta"><span class="sop-badge">'+esc(s.category)+'</span>'+
+          (s.sopId ? '<span class="sop-idtag">'+esc(s.sopId)+'</span>' : '')+'</div>'+
+        '<div class="sop-preview">'+sopHighlight(preview, q)+'</div></div>';
+    }
+    list.innerHTML = html;
+    var cards = list.querySelectorAll("[data-sopopen]");
+    for (var c=0;c<cards.length;c++){
+      cards[c].addEventListener("click", function(){ openSopDetail(this.getAttribute("data-sopopen")); });
+    }
+  }
+
+  function openSopDetail(id){ state.sopDetailId = id; renderSops(); window.scrollTo({top:0, behavior:"smooth"}); }
+  function closeSopDetail(){ state.sopDetailId = null; renderSops(); }
+
+  function renderSopDetail(){
+    var s = state.sops.filter(function(x){ return x.id === state.sopDetailId; })[0];
+    if (!s){ state.sopDetailId = null; renderSops(); return; }
+    $("sops").innerHTML =
+      '<button class="sop-back" id="sopBack">'+
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg> Back to SOPs</button>'+
+      '<div class="sup-card">'+
+        '<div class="sop-detail-title">'+esc(s.title)+'</div>'+
+        '<div class="sop-detail-meta">'+
+          '<span class="sop-badge">'+esc(s.category)+'</span>'+
+          (s.sopId ? '<span class="sop-idtag">'+esc(s.sopId)+'</span>' : '')+
+          (s.updated ? '<span class="sop-updated">Updated '+esc(s.updated)+'</span>' : '')+
+        '</div>'+
+        '<div class="sop-detail-body">'+esc(s.body)+'</div>'+
+      '</div>';
+    $("sopBack").addEventListener("click", closeSopDetail);
+  }
+
+  /* Admin manage view (admins only — gated by the existing admin PIN). */
+  function renderSopAdmin(){
+    var toggle = '<div class="sop-toggle">'+
+      '<button class="sup-pill" data-sopmode="browse">Browse SOPs</button>'+
+      '<button class="sup-pill active" data-sopmode="manage">Manage SOPs</button></div>';
+    var subtabs = '<div class="sup-subtabs">'+
+      '<button class="sup-pill'+(state.sopAdminTab==="list"?" active":"")+'" data-sopadmin="list">All SOPs</button>'+
+      '<button class="sup-pill'+(state.sopAdminTab==="add"?" active":"")+'" data-sopadmin="add">'+(state.sopEditId?"Edit SOP":"Add New SOP")+'</button></div>';
+    var body = (state.sopAdminTab === "add") ? sopFormHtml() : sopAdminListHtml();
+    $("sops").innerHTML = toggle + subtabs + body;
+    sopWireAdmin();
+  }
+  function sopAdminListHtml(){
+    var rows = "";
+    if (!state.sops.length){
+      rows = '<div class="sup-empty">No SOPs yet. Use Add New SOP to create the first one.</div>';
+    } else {
+      for (var i=0;i<state.sops.length;i++){
+        var s = state.sops[i];
+        rows += '<div class="sop-arow">'+
+          '<div style="flex:1"><div class="sop-arow-name">'+esc(s.title)+'</div>'+
+          '<div class="sop-arow-cat">'+esc(s.category)+(s.sopId?" &middot; "+esc(s.sopId):"")+'</div></div>'+
+          '<div class="sup-actions">'+
+            '<button class="sop-act edit" data-sopedit="'+esc(s.id)+'">Edit</button>'+
+            '<button class="sop-act del" data-sopdel="'+esc(s.id)+'">Remove</button>'+
+          '</div></div>';
+      }
+    }
+    return '<div class="sup-card"><div class="sup-card-title">All SOPs — edit or remove</div>'+rows+'</div>';
+  }
+  function sopFormHtml(){
+    var editing = state.sopEditId ? state.sops.filter(function(s){ return s.id===state.sopEditId; })[0] : null;
+    var t = editing ? editing.title : "";
+    var cat = editing ? editing.category : "Intake";
+    var sid = editing ? (editing.sopId||"") : "";
+    var bd = editing ? editing.body : "";
+    var opts = "";
+    for (var i=0;i<SOP_CATEGORIES.length;i++){
+      var c = SOP_CATEGORIES[i];
+      if (c === "All") continue;
+      opts += '<option value="'+esc(c)+'"'+(c===cat?" selected":"")+'>'+esc(c)+'</option>';
+    }
+    return '<div class="sup-card">'+
+      '<div class="sup-card-title">'+(editing?"Edit SOP":"Add new SOP")+'</div>'+
+      '<div class="sop-field"><label>SOP title</label>'+
+        '<input type="text" id="sopfTitle" placeholder="e.g. Electronics Intake Procedure" value="'+esc(t)+'"></div>'+
+      '<div class="sop-field"><label>Category</label><select id="sopfCat">'+opts+'</select></div>'+
+      '<div class="sop-field"><label>SOP ID (optional — e.g. SOP-001)</label>'+
+        '<input type="text" id="sopfId" placeholder="SOP-001" value="'+esc(sid)+'"></div>'+
+      '<div class="sop-field"><label>Content — steps, rules, and notes</label>'+
+        '<textarea id="sopfBody" placeholder="Step 1: ...">'+esc(bd)+'</textarea></div>'+
+      '<div class="sop-form-actions">'+
+        '<button class="sop-save" id="sopSave">Save SOP</button>'+
+        '<button class="sop-cancel" id="sopCancel">Cancel</button>'+
+      '</div></div>';
+  }
+  function sopWireAdmin(){
+    var sc = $("sops");
+    var modes = sc.querySelectorAll("[data-sopmode]");
+    for (var i=0;i<modes.length;i++){
+      modes[i].addEventListener("click", function(){
+        state.sopAdminMode = (this.getAttribute("data-sopmode") === "manage");
+        if (!state.sopAdminMode){ state.sopEditId = ""; state.sopAdminTab = "list"; }
+        renderSops();
+      });
+    }
+    var subs = sc.querySelectorAll("[data-sopadmin]");
+    for (var a=0;a<subs.length;a++){
+      subs[a].addEventListener("click", function(){
+        state.sopAdminTab = this.getAttribute("data-sopadmin");
+        if (state.sopAdminTab === "list"){ state.sopEditId = ""; }
+        renderSopAdmin();
+      });
+    }
+    var edits = sc.querySelectorAll("[data-sopedit]");
+    for (var e=0;e<edits.length;e++){
+      edits[e].addEventListener("click", function(){
+        state.sopEditId = this.getAttribute("data-sopedit");
+        state.sopAdminTab = "add";
+        renderSopAdmin();
+      });
+    }
+    var dels = sc.querySelectorAll("[data-sopdel]");
+    for (var d=0;d<dels.length;d++){
+      dels[d].addEventListener("click", function(){ sopDelete(this.getAttribute("data-sopdel")); });
+    }
+    var save = sc.querySelector("#sopSave");
+    if (save) save.addEventListener("click", sopSave);
+    var cancel = sc.querySelector("#sopCancel");
+    if (cancel) cancel.addEventListener("click", function(){
+      state.sopEditId = ""; state.sopAdminTab = "list"; renderSopAdmin();
+    });
+  }
+  function sopSave(){
+    var title = ($("sopfTitle").value || "").trim();
+    var cat = $("sopfCat").value;
+    var sid = ($("sopfId").value || "").trim();
+    var bd = ($("sopfBody").value || "").trim();
+    if (!title){ supToast("Please enter a title"); return; }
+    if (!bd){ supToast("Please enter the SOP content"); return; }
+    var editing = !!state.sopEditId;
+    var url = editing ? "/api/sops/"+encodeURIComponent(state.sopEditId) : "/api/sops";
+    fetch(url, { method: editing ? "PUT" : "POST", headers: headers(true),
+      body: JSON.stringify({ title:title, category:cat, sopId:sid, body:bd }) })
+      .then(function(r){ return r.json(); })
+      .then(function(res){
+        if (res && res.success){
+          supToast(editing ? "SOP updated" : "SOP added");
+          state.sopEditId = ""; state.sopAdminTab = "list";
+          loadSops();
+        } else { supToast((res&&res.error)||"Could not save SOP"); }
+      })
+      .catch(function(){ supToast("Network error"); });
+  }
+  function sopDelete(id){
+    if (!confirm("Remove this SOP? This cannot be undone.")) return;
+    fetch("/api/sops/"+encodeURIComponent(id), { method:"DELETE", headers: headers(false) })
+      .then(function(r){ return r.json(); })
+      .then(function(res){
+        if (res && res.success){ supToast("SOP removed"); loadSops(); }
+        else { supToast((res&&res.error)||"Could not remove"); }
+      })
+      .catch(function(){ supToast("Network error"); });
+  }
+
   /* ---------- PIN modal ---------- */
   function showPin(){
     state.pinLevel = null; state.pinDigits = "";
@@ -2004,7 +2459,9 @@ const JS_STR = `
           hidePin();
           applyAccess();
           renderTabs();
-          if (state.location === "Supplies"){ showSuppliesView(); } else { showFeedView(); }
+          if (state.location === "Supplies"){ showSuppliesView(); }
+          else if (state.location === "SOPs"){ showSopsView(); }
+          else { showFeedView(); }
           loadTeam(); loadPosts();
         } else {
           state.pinDigits = "";
@@ -2077,6 +2534,7 @@ console.log('[OPS] Photos directory: ' + PHOTOS_DIR);
 console.log('[OPS] Team initialized: ' + team.length + ' members');
 console.log('[OPS] Posts loaded: ' + posts.length);
 console.log('[OPS] Supplies items: ' + supplies.items.length);
+console.log('[OPS] SOPs loaded: ' + sops.length);
 server.listen(PORT, function () {
   console.log('[OPS] Running on port ' + PORT);
   console.log('[OPS] Ready — visit /ping to verify');

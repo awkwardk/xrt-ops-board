@@ -137,6 +137,61 @@ async function run() {
   }, JSON.stringify({ currentAdminPin: '9241', newStaffPin: '1234', newAdminPin: '5678' }));
   check('POST /api/settings/pins correct PIN -> updates successfully',
     goodPin.json && goodPin.json.success === true, JSON.stringify(goodPin.json));
+
+  // ---- SOPs ----
+  // 8. GET /api/sops returns the 2 pre-loaded placeholder SOPs
+  const sops0 = await request({ path: '/api/sops' });
+  check('GET /api/sops returns array with 2 default SOPs',
+    Array.isArray(sops0.json) && sops0.json.length === 2 &&
+    sops0.json.some(function (s) { return s.sopId === 'SOP-001'; }) &&
+    sops0.json.some(function (s) { return s.sopId === 'SOP-002'; }),
+    sops0.json ? 'length=' + sops0.json.length : 'null');
+
+  // 9. auth enforcement: create without admin header is blocked
+  const sopNoAuth = await request({
+    method: 'POST', path: '/api/sops', headers: { 'Content-Type': 'application/json' }
+  }, JSON.stringify({ title: 'Sneaky', category: 'General', body: 'nope' }));
+  check('POST /api/sops without admin header -> blocked',
+    sopNoAuth.status === 403 && sopNoAuth.json && sopNoAuth.json.success === false,
+    'status=' + sopNoAuth.status);
+
+  // 10. create with admin header
+  const sopCreated = await request({
+    method: 'POST', path: '/api/sops',
+    headers: { 'X-Access-Level': 'admin', 'Content-Type': 'application/json' }
+  }, JSON.stringify({ title: 'Test SOP', category: 'Safety', sopId: 'SOP-TEST', body: 'Wear gloves.' }));
+  const sopId = sopCreated.json && sopCreated.json.sop && sopCreated.json.sop.id;
+  check('POST /api/sops (admin) creates a SOP',
+    !!sopId && sopCreated.json.sop.title === 'Test SOP' && !!sopCreated.json.sop.updated,
+    JSON.stringify(sopCreated.json));
+
+  // 11. update with admin header
+  const sopUpdated = await request({
+    method: 'PUT', path: '/api/sops/' + encodeURIComponent(sopId || 'x'),
+    headers: { 'X-Access-Level': 'admin', 'Content-Type': 'application/json' }
+  }, JSON.stringify({ title: 'Test SOP Edited', category: 'Safety', sopId: 'SOP-TEST', body: 'Wear gloves and goggles.' }));
+  check('PUT /api/sops/:id (admin) updates a SOP',
+    sopUpdated.json && sopUpdated.json.success === true &&
+    sopUpdated.json.sop.title === 'Test SOP Edited',
+    JSON.stringify(sopUpdated.json));
+
+  // 12. auth enforcement: delete without admin header is blocked
+  const sopDelNoAuth = await request({
+    method: 'DELETE', path: '/api/sops/' + encodeURIComponent(sopId || 'x')
+  });
+  check('DELETE /api/sops/:id without admin header -> blocked',
+    sopDelNoAuth.status === 403 && sopDelNoAuth.json && sopDelNoAuth.json.success === false,
+    'status=' + sopDelNoAuth.status);
+
+  // 13. delete with admin header
+  const sopDel = await request({
+    method: 'DELETE', path: '/api/sops/' + encodeURIComponent(sopId || 'x'),
+    headers: { 'X-Access-Level': 'admin' }
+  });
+  const sopsAfter = await request({ path: '/api/sops' });
+  const sopGone = Array.isArray(sopsAfter.json) && !sopsAfter.json.some(function (s) { return s.id === sopId; });
+  check('DELETE /api/sops/:id (admin) removes the SOP',
+    sopDel.json && sopDel.json.success === true && sopGone, JSON.stringify(sopDel.json));
 }
 
 let child;
