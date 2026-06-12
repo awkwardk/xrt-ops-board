@@ -45,10 +45,25 @@ const DEFAULT_SETTINGS = {
   adminPin: '9241'
 };
 
+/*
+ * Supplies tracker data. items = supply types; flags = per-location
+ * low-stock flags moving through flagged -> confirmed -> ordered.
+ * Default items match the spec: Pallet Wrap, Gaylord Boxes, Pallets.
+ */
+const DEFAULT_SUPPLIES = {
+  items: [
+    { id: '1', name: 'Pallet Wrap', category: 'Shipping' },
+    { id: '2', name: 'Gaylord Boxes', category: 'Shipping' },
+    { id: '3', name: 'Pallets', category: 'Shipping' }
+  ],
+  flags: []
+};
+
 // In-memory stores
 let posts = [];
 let team = [];
 let settings = {};
+let supplies = { items: [], flags: [] };
 
 /* Read a JSON file from disk, returning fallback on any problem. */
 function readJsonFile(file, fallback) {
@@ -81,12 +96,17 @@ function loadData() {
   posts = readJsonFile(path.join(DATA_DIR, 'posts.json'), []);
   team = readJsonFile(path.join(DATA_DIR, 'team.json'), DEFAULT_TEAM.slice());
   settings = readJsonFile(path.join(DATA_DIR, 'settings.json'), Object.assign({}, DEFAULT_SETTINGS));
+  supplies = readJsonFile(path.join(DATA_DIR, 'supplies.json'), null);
 
   if (!Array.isArray(posts)) posts = [];
   if (!Array.isArray(team)) team = DEFAULT_TEAM.slice();
   if (!settings || typeof settings !== 'object') settings = Object.assign({}, DEFAULT_SETTINGS);
   if (!settings.staffPin) settings.staffPin = DEFAULT_SETTINGS.staffPin;
   if (!settings.adminPin) settings.adminPin = DEFAULT_SETTINGS.adminPin;
+  if (!supplies || typeof supplies !== 'object' ||
+      !Array.isArray(supplies.items) || !Array.isArray(supplies.flags)) {
+    supplies = JSON.parse(JSON.stringify(DEFAULT_SUPPLIES));
+  }
 
   // Persist a baseline so the JSON files exist on first run.
   saveData();
@@ -110,6 +130,9 @@ function saveData(which) {
     }
     if (!which || which === 'settings') {
       fs.writeFileSync(path.join(DATA_DIR, 'settings.json'), JSON.stringify(settings, null, 2));
+    }
+    if (!which || which === 'supplies') {
+      fs.writeFileSync(path.join(DATA_DIR, 'supplies.json'), JSON.stringify(supplies, null, 2));
     }
   } catch (err) {
     console.error('[OPS] saveData failed:', err.message);
@@ -537,6 +560,117 @@ function handleVerifyPin(req, res) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Supplies tracker handlers
+ *
+ * Stored on disk in supplies.json via the same loadData/saveData
+ * pattern. Reads are open (staff need to see + flag); admin-only
+ * mutations (status changes, add/remove items) require the
+ * X-Access-Level: admin header, exactly like other admin actions.
+ * ------------------------------------------------------------------ */
+
+function handleGetSupplies(req, res) {
+  sendJson(res, 200, { items: supplies.items, flags: supplies.flags });
+}
+
+/* Staff (or anyone) toggles a low-stock flag for an item at a location. */
+function handleFlagSupply(req, res) {
+  readBody(req, 16 * 1024, function (err, buf) {
+    if (err) return sendJson(res, 400, { success: false, error: err.message });
+    try {
+      const body = JSON.parse(buf.toString('utf8') || '{}');
+      const itemId = String(body.itemId || '');
+      const location = String(body.location || '').trim();
+      if (!itemId || !location) {
+        return sendJson(res, 400, { success: false, error: 'Missing itemId or location' });
+      }
+      if (!supplies.items.some(function (i) { return i.id === itemId; })) {
+        return sendJson(res, 404, { success: false, error: 'Item not found' });
+      }
+      const idx = supplies.flags.findIndex(function (f) {
+        return f.itemId === itemId && f.location === location;
+      });
+      if (idx >= 0 && supplies.flags[idx].status === 'flagged') {
+        supplies.flags.splice(idx, 1); // un-flag
+      } else if (idx < 0) {
+        supplies.flags.push({ itemId: itemId, location: location, status: 'flagged', ts: new Date().toISOString() });
+      } // confirmed/ordered flags are left for admins to manage
+      saveData('supplies');
+      sendJson(res, 200, { success: true, flags: supplies.flags });
+    } catch (e) {
+      sendJson(res, 500, { success: false, error: 'Could not update flag' });
+    }
+  });
+}
+
+/* Admin moves a flag through confirmed -> ordered, or clears it. */
+function handleSupplyStatus(req, res) {
+  if (!isAdmin(req)) return sendJson(res, 403, { success: false, error: 'Admin only' });
+  readBody(req, 16 * 1024, function (err, buf) {
+    if (err) return sendJson(res, 400, { success: false, error: err.message });
+    try {
+      const body = JSON.parse(buf.toString('utf8') || '{}');
+      const itemId = String(body.itemId || '');
+      const location = String(body.location || '').trim();
+      const status = String(body.status || '').trim();
+      const idx = supplies.flags.findIndex(function (f) {
+        return f.itemId === itemId && f.location === location;
+      });
+      if (idx < 0) return sendJson(res, 404, { success: false, error: 'Flag not found' });
+      if (status === 'clear') {
+        supplies.flags.splice(idx, 1);
+      } else if (status === 'confirmed' || status === 'ordered') {
+        supplies.flags[idx].status = status;
+      } else {
+        return sendJson(res, 400, { success: false, error: 'Invalid status' });
+      }
+      saveData('supplies');
+      sendJson(res, 200, { success: true, flags: supplies.flags });
+    } catch (e) {
+      sendJson(res, 500, { success: false, error: 'Could not update status' });
+    }
+  });
+}
+
+/* Admin adds a new supply item. */
+function handleAddSupplyItem(req, res) {
+  if (!isAdmin(req)) return sendJson(res, 403, { success: false, error: 'Admin only' });
+  readBody(req, 16 * 1024, function (err, buf) {
+    if (err) return sendJson(res, 400, { success: false, error: err.message });
+    try {
+      const body = JSON.parse(buf.toString('utf8') || '{}');
+      const name = String(body.name || '').trim();
+      const category = String(body.category || 'Other').trim() || 'Other';
+      if (!name) return sendJson(res, 400, { success: false, error: 'Item name required' });
+      if (supplies.items.some(function (i) { return i.name.toLowerCase() === name.toLowerCase(); })) {
+        return sendJson(res, 400, { success: false, error: 'That item already exists' });
+      }
+      const item = {
+        id: 's-' + Date.now() + '-' + Math.floor(Math.random() * 10000),
+        name: name,
+        category: category
+      };
+      supplies.items.push(item);
+      saveData('supplies');
+      sendJson(res, 200, { success: true, item: item, items: supplies.items });
+    } catch (e) {
+      sendJson(res, 500, { success: false, error: 'Could not add item' });
+    }
+  });
+}
+
+/* Admin removes a supply item and any flags referencing it. */
+function handleDeleteSupplyItem(req, res, id) {
+  if (!isAdmin(req)) return sendJson(res, 403, { success: false, error: 'Admin only' });
+  const target = decodeURIComponent(id);
+  const before = supplies.items.length;
+  supplies.items = supplies.items.filter(function (i) { return i.id !== target; });
+  if (supplies.items.length === before) return sendJson(res, 404, { success: false, error: 'Not found' });
+  supplies.flags = supplies.flags.filter(function (f) { return f.itemId !== target; });
+  saveData('supplies');
+  sendJson(res, 200, { success: true });
+}
+
+/* ------------------------------------------------------------------ *
  * Router
  * ------------------------------------------------------------------ */
 
@@ -595,6 +729,23 @@ const server = http.createServer(function (req, res) {
     }
     if (pathname === '/api/verify-pin' && method === 'POST') {
       return handleVerifyPin(req, res);
+    }
+
+    // Supplies tracker
+    if (pathname === '/api/supplies' && method === 'GET') {
+      return handleGetSupplies(req, res);
+    }
+    if (pathname === '/api/supplies/flag' && method === 'POST') {
+      return handleFlagSupply(req, res);
+    }
+    if (pathname === '/api/supplies/flag/status' && method === 'POST') {
+      return handleSupplyStatus(req, res);
+    }
+    if (pathname === '/api/supplies/items' && method === 'POST') {
+      return handleAddSupplyItem(req, res);
+    }
+    if ((m = /^\/api\/supplies\/items\/([^/]+)$/.exec(pathname)) && method === 'DELETE') {
+      return handleDeleteSupplyItem(req, res, m[1]);
     }
 
     sendJson(res, 404, { success: false, error: 'Not found' });
@@ -813,6 +964,68 @@ header{position:sticky; top:0; z-index:20; background:#fff;
 .pin-back{margin-top:18px; background:none; border:none; color:var(--text2);
   font-size:14px; min-height:44px;}
 
+/* Supplies tab */
+#supplies{padding:0 12px;}
+.sup-card{background:var(--card); border:0.5px solid var(--border); border-radius:12px;
+  padding:14px; margin-bottom:10px;}
+.sup-card-title{font-size:11px; font-weight:700; color:var(--text2); text-transform:uppercase;
+  letter-spacing:1px; margin-bottom:10px;}
+.sup-loc-bar{display:flex; gap:8px; flex-wrap:wrap;}
+.sup-subtabs{display:flex; gap:8px; margin-bottom:10px; overflow-x:auto; padding-bottom:2px;}
+.sup-subtabs::-webkit-scrollbar{display:none;}
+.sup-pill{flex:0 0 auto; min-height:36px; padding:7px 16px; border-radius:18px;
+  border:1.5px solid var(--green); background:#fff; color:var(--green); font-weight:600;
+  font-size:13px; white-space:nowrap;}
+.sup-pill.active{background:var(--green); color:#fff;}
+.sup-list{display:flex; flex-direction:column; gap:8px;}
+.sup-row{background:#fff; border:1px solid var(--border); border-radius:10px;
+  padding:12px 14px; display:flex; align-items:center; gap:10px;}
+.sup-row.flagged{border-color:var(--urgent); background:var(--urgent-l);}
+.sup-row.confirmed{border-color:var(--warning); background:var(--warning-l);}
+.sup-row.ordered{border-color:var(--success); background:var(--success-l);}
+.sup-name{font-size:14px; font-weight:600; color:var(--text);}
+.sup-cat{font-size:12px; color:var(--text2); margin-top:2px;}
+.sup-status{font-size:10px; font-weight:700; padding:3px 9px; border-radius:10px;
+  white-space:nowrap; text-transform:uppercase; letter-spacing:.3px;}
+.sup-status.ok{background:var(--green-light); color:var(--green);}
+.sup-status.flagged{background:var(--urgent-l); color:var(--urgent);}
+.sup-status.confirmed{background:var(--warning-l); color:var(--warning);}
+.sup-status.ordered{background:var(--success-l); color:var(--success);}
+.sup-flag-btn{border:1.5px solid var(--green); background:#fff; color:var(--green);
+  border-radius:8px; min-height:38px; padding:7px 14px; font-size:13px; font-weight:600;
+  white-space:nowrap;}
+.sup-flag-btn:active{background:var(--green-light);}
+.sup-flag-btn.unflag{border-color:var(--urgent); color:var(--urgent);}
+.sup-summary{display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-bottom:10px;}
+@media(max-width:440px){.sup-summary{grid-template-columns:1fr 1fr;}}
+.sup-stat{background:var(--green-light); border:1px solid var(--border); border-radius:12px;
+  padding:10px 6px; text-align:center;}
+.sup-stat .n{font-size:20px; font-weight:700; line-height:1.1; color:var(--green);}
+.sup-stat .l{font-size:10px; color:var(--text2); margin-top:3px;}
+.sup-stat.low .n{color:var(--urgent);}
+.sup-stat.confirmed .n{color:var(--warning);}
+.sup-stat.ordered .n{color:var(--success);}
+.sup-arow{background:#fff; border:1px solid var(--border); border-radius:10px;
+  padding:12px 14px; margin-bottom:8px;}
+.sup-arow-top{display:flex; align-items:center; gap:10px;}
+.sup-actions{display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end;}
+.sup-act{border:1.5px solid var(--border); background:#fff; color:var(--text2);
+  border-radius:8px; min-height:36px; padding:6px 12px; font-size:12px; font-weight:600;}
+.sup-act.confirm{border-color:var(--warning); color:var(--warning);}
+.sup-act.order{border-color:var(--success); color:var(--success);}
+.sup-act.clear{border-color:var(--text2); color:var(--text2);}
+.sup-act.del{border-color:var(--urgent); color:var(--urgent);}
+.sup-loc-tag{font-size:12px; color:var(--text2); margin-top:3px;}
+.sup-add{display:flex; flex-direction:column; gap:8px; margin-top:12px;
+  border-top:1px solid var(--border); padding-top:12px;}
+.sup-add input,.sup-add select{width:100%; padding:10px 12px; border:1.5px solid var(--border);
+  border-radius:10px; font-size:15px; font-family:inherit; background:#fff; color:var(--text);}
+.sup-empty{text-align:center; color:var(--text2); padding:28px 16px; font-size:14px;}
+.sup-toast{position:fixed; bottom:84px; left:50%; transform:translateX(-50%);
+  background:var(--green); color:#fff; font-size:13px; font-weight:600; padding:9px 20px;
+  border-radius:20px; opacity:0; transition:opacity .2s; pointer-events:none; z-index:100;}
+.sup-toast.show{opacity:1;}
+
 /* Lightbox */
 .lightbox{position:fixed; inset:0; background:rgba(0,0,0,.95); z-index:80;
   display:flex; align-items:center; justify-content:center;
@@ -851,9 +1064,11 @@ const BODY_STR = `
   <div class="tabs" id="tabs"></div>
   <div class="stats" id="stats"></div>
   <div class="feed" id="feed"></div>
+  <div id="supplies" class="hidden"></div>
 
   <button class="fab" id="fab" title="Add update">+</button>
 </div>
+<div class="sup-toast" id="supToast"></div>
 
 <!-- Add update modal -->
 <div class="overlay" id="addOverlay">
@@ -988,8 +1203,12 @@ const JS_STR = `
     photos: [],        // selected File objects for new post
     pendingDelete: null,
     pinLevel: null,
-    pinDigits: ""
+    pinDigits: "",
+    supLocation: "Cole",          // staff supplies location selector
+    supData: { items: [], flags: [] },
+    supTab: "flagged"             // admin supplies sub-tab
   };
+  var SUP_LOCS = ["Cole","Dayton","Visalia"];
 
   function $(id){ return document.getElementById(id); }
   function esc(s){
@@ -1053,10 +1272,10 @@ const JS_STR = `
 
   /* ---------- Tabs ---------- */
   function renderTabs(){
-    // Management is the last tab and is rendered for admins only — it
-    // is entirely absent from the DOM for staff.
+    // Management is admin-only; Supplies is the final tab for everyone.
     var locs = LOCATIONS.slice();
     if (isAdmin()) locs.push("Management");
+    locs.push("Supplies");
     var html = "";
     for (var i=0;i<locs.length;i++){
       var loc = locs[i];
@@ -1068,9 +1287,30 @@ const JS_STR = `
     for (var j=0;j<btns.length;j++){
       btns[j].addEventListener("click", function(){
         state.location = this.getAttribute("data-loc");
-        renderTabs(); renderStats(); renderFeed();
+        renderTabs();
+        if (state.location === "Supplies"){
+          showSuppliesView();
+        } else {
+          showFeedView();
+          renderStats(); renderFeed();
+        }
       });
     }
+  }
+
+  // Toggle between the normal posts view and the supplies view.
+  function showSuppliesView(){
+    $("stats").classList.add("hidden");
+    $("feed").classList.add("hidden");
+    $("fab").classList.add("hidden");
+    $("supplies").classList.remove("hidden");
+    loadSupplies();
+  }
+  function showFeedView(){
+    $("supplies").classList.add("hidden");
+    $("stats").classList.remove("hidden");
+    $("feed").classList.remove("hidden");
+    $("fab").classList.remove("hidden");
   }
 
   /* ---------- Stats ---------- */
@@ -1456,6 +1696,253 @@ const JS_STR = `
     $("lbImg").src = "";
   }
 
+  /* ---------- Supplies ---------- */
+  function loadSupplies(){
+    fetch("/api/supplies")
+      .then(function(r){ return r.json(); })
+      .then(function(data){
+        state.supData = (data && Array.isArray(data.items) && Array.isArray(data.flags))
+          ? data : { items: [], flags: [] };
+        renderSupplies();
+      })
+      .catch(function(){ renderSupplies(); });
+  }
+  function supFindFlag(itemId, location){
+    return state.supData.flags.filter(function(f){
+      return f.itemId===itemId && f.location===location;
+    })[0];
+  }
+  function supToast(msg){
+    var t = $("supToast");
+    t.textContent = msg; t.classList.add("show");
+    setTimeout(function(){ t.classList.remove("show"); }, 1800);
+  }
+  function renderSupplies(){
+    if (isAdmin()) renderSuppliesAdmin();
+    else renderSuppliesStaff();
+  }
+
+  /* Staff: pick a location and flag items as running low. */
+  function renderSuppliesStaff(){
+    var d = state.supData;
+    var locBar = "";
+    for (var i=0;i<SUP_LOCS.length;i++){
+      var loc = SUP_LOCS[i];
+      locBar += '<button class="sup-pill'+(loc===state.supLocation?" active":"")+'" data-suploc="'+esc(loc)+'">'+esc(loc)+'</button>';
+    }
+    var rows = "";
+    if (!d.items.length){
+      rows = '<div class="sup-empty">No supplies configured yet. Ask an admin to add items.</div>';
+    } else {
+      for (var k=0;k<d.items.length;k++) rows += supStaffRow(d.items[k]);
+    }
+    $("supplies").innerHTML =
+      '<div class="sup-card"><div class="sup-card-title">Your location</div>'+
+        '<div class="sup-loc-bar">'+locBar+'</div></div>'+
+      '<div class="sup-card"><div class="sup-card-title">Supplies — tap to flag as running low</div>'+
+        '<div class="sup-list">'+rows+'</div></div>';
+    var pills = $("supplies").querySelectorAll("[data-suploc]");
+    for (var p=0;p<pills.length;p++){
+      pills[p].addEventListener("click", function(){
+        state.supLocation = this.getAttribute("data-suploc");
+        renderSuppliesStaff();
+      });
+    }
+    var fbs = $("supplies").querySelectorAll("[data-supflag]");
+    for (var f=0;f<fbs.length;f++){
+      fbs[f].addEventListener("click", function(){ supToggleFlag(this.getAttribute("data-supflag")); });
+    }
+  }
+  function supStaffRow(item){
+    var flag = supFindFlag(item.id, state.supLocation);
+    var sc = "ok", st = "OK", ft = "Mark as low", unflag = false;
+    if (flag){
+      if (flag.status === "flagged"){ sc="flagged"; st="Running low"; ft="Undo flag"; unflag=true; }
+      else if (flag.status === "confirmed"){ sc="confirmed"; st="Confirmed — pending order"; ft=""; }
+      else if (flag.status === "ordered"){ sc="ordered"; st="Order placed"; ft=""; }
+    }
+    var btn = ft ? '<button class="sup-flag-btn'+(unflag?" unflag":"")+'" data-supflag="'+item.id+'">'+ft+'</button>' : '';
+    return '<div class="sup-row '+sc+'">'+
+      '<div style="flex:1"><div class="sup-name">'+esc(item.name)+'</div>'+
+      '<div class="sup-cat">'+esc(item.category)+'</div></div>'+
+      '<span class="sup-status '+sc+'">'+esc(st)+'</span>'+btn+'</div>';
+  }
+  function supToggleFlag(itemId){
+    fetch("/api/supplies/flag", { method:"POST", headers: headers(true),
+      body: JSON.stringify({ itemId:itemId, location: state.supLocation }) })
+      .then(function(r){ return r.json(); })
+      .then(function(res){
+        if (res && res.flags){ state.supData.flags = res.flags; renderSupplies(); supToast("Updated"); }
+        else { supToast((res&&res.error)||"Could not update"); }
+      })
+      .catch(function(){ supToast("Network error"); });
+  }
+
+  /* Admin: management view with summary + sub-tabs. */
+  function renderSuppliesAdmin(){
+    var d = state.supData;
+    var low = d.flags.filter(function(f){ return f.status==="flagged"; }).length;
+    var confirmed = d.flags.filter(function(f){ return f.status==="confirmed"; }).length;
+    var ordered = d.flags.filter(function(f){ return f.status==="ordered"; }).length;
+    var summary = '<div class="sup-summary">'+
+      supStat("total", d.items.length, "Total items")+
+      supStat("low", low, "Flagged low")+
+      supStat("confirmed", confirmed, "Confirmed")+
+      supStat("ordered", ordered, "Ordered")+'</div>';
+    var subtabs = '<div class="sup-subtabs">'+
+      supSubtab("flagged","Needs Attention")+
+      supSubtab("all","All Items")+
+      supSubtab("order","Order List")+'</div>';
+    var body = "";
+    if (state.supTab === "all") body = supAllView(d);
+    else if (state.supTab === "order") body = supOrderView(d);
+    else body = supFlaggedView(d);
+    $("supplies").innerHTML = summary + subtabs + body;
+    supWireAdmin();
+  }
+  function supStat(cls, n, label){
+    return '<div class="sup-stat '+cls+'"><div class="n">'+n+'</div><div class="l">'+esc(label)+'</div></div>';
+  }
+  function supSubtab(key, label){
+    return '<button class="sup-pill'+(state.supTab===key?" active":"")+'" data-supsubtab="'+key+'">'+esc(label)+'</button>';
+  }
+  function supActBtn(cls, flag, status, label){
+    return '<button class="sup-act '+cls+'" data-supitem="'+esc(flag.itemId)+'" data-suploc2="'+esc(flag.location)+'" data-supstatus="'+status+'">'+esc(label)+'</button>';
+  }
+  function supFlaggedView(d){
+    var active = d.flags.filter(function(f){ return f.status==="flagged" || f.status==="confirmed"; });
+    var rows = "";
+    if (!active.length){
+      rows = '<div class="sup-empty">No items flagged right now.</div>';
+    } else {
+      for (var i=0;i<active.length;i++){
+        var flag = active[i];
+        var item = d.items.filter(function(it){ return it.id===flag.itemId; })[0];
+        if (!item) continue;
+        var btns;
+        if (flag.status === "flagged"){
+          btns = supActBtn("confirm", flag, "confirmed", "Confirm")+
+                 supActBtn("order", flag, "ordered", "Mark ordered")+
+                 supActBtn("clear", flag, "clear", "Clear");
+        } else {
+          btns = supActBtn("order", flag, "ordered", "Mark ordered")+
+                 supActBtn("clear", flag, "clear", "Clear");
+        }
+        rows += '<div class="sup-arow"><div class="sup-arow-top">'+
+          '<div style="flex:1"><div class="sup-name">'+esc(item.name)+'</div>'+
+          '<div class="sup-loc-tag">'+esc(flag.location)+' &middot; '+esc(timeAgo(flag.ts))+'</div></div>'+
+          '<div class="sup-actions">'+btns+'</div></div></div>';
+      }
+    }
+    return '<div class="sup-card"><div class="sup-card-title">Flagged by staff — review and act</div>'+rows+'</div>';
+  }
+  function supAllView(d){
+    var rows = "";
+    if (!d.items.length){
+      rows = '<div class="sup-empty">No items yet.</div>';
+    } else {
+      for (var i=0;i<d.items.length;i++){
+        var item = d.items[i];
+        rows += '<div class="sup-arow"><div class="sup-arow-top">'+
+          '<div style="flex:1"><div class="sup-name">'+esc(item.name)+'</div>'+
+          '<div class="sup-loc-tag">'+esc(item.category)+'</div></div>'+
+          '<div class="sup-actions"><button class="sup-act del" data-supdel="'+esc(item.id)+'">Remove</button></div>'+
+          '</div></div>';
+      }
+    }
+    var addForm = '<div class="sup-add"><div class="sup-card-title" style="margin-bottom:0">Add new item</div>'+
+      '<input type="text" id="sup-new-name" placeholder="Item name (e.g. Pallet wrap)">'+
+      '<select id="sup-new-cat">'+
+        '<option value="Shipping">Shipping</option>'+
+        '<option value="Equipment">Equipment</option>'+
+        '<option value="Office">Office</option>'+
+        '<option value="Cleaning">Cleaning</option>'+
+        '<option value="Other">Other</option>'+
+      '</select>'+
+      '<button class="btn-primary" id="sup-add-btn">Add item</button></div>';
+    return '<div class="sup-card"><div class="sup-card-title">All supply items</div>'+rows+addForm+'</div>';
+  }
+  function supOrderView(d){
+    var list = d.flags.filter(function(f){ return f.status==="confirmed" || f.status==="ordered"; });
+    var rows = "";
+    if (!list.length){
+      rows = '<div class="sup-empty">No confirmed orders yet. Confirm flagged items to build the list.</div>';
+    } else {
+      for (var i=0;i<list.length;i++){
+        var flag = list[i];
+        var item = d.items.filter(function(it){ return it.id===flag.itemId; })[0];
+        if (!item) continue;
+        var isOrdered = flag.status === "ordered";
+        var label = isOrdered ? "Ordered" : "Confirmed — needs ordering";
+        var cls = isOrdered ? "ordered" : "confirmed";
+        var act = isOrdered ? supActBtn("clear", flag, "clear", "Done")
+                            : supActBtn("order", flag, "ordered", "Mark ordered");
+        rows += '<div class="sup-row '+cls+'">'+
+          '<div style="flex:1"><div class="sup-name">'+esc(item.name)+'</div>'+
+          '<div class="sup-loc-tag">'+esc(flag.location)+' &middot; '+esc(label)+'</div></div>'+
+          '<span class="sup-status '+cls+'">'+esc(timeAgo(flag.ts))+'</span>'+act+'</div>';
+      }
+    }
+    return '<div class="sup-card"><div class="sup-card-title">Order list — confirmed low stock</div>'+rows+'</div>';
+  }
+  function supWireAdmin(){
+    var sc = $("supplies");
+    var subtabs = sc.querySelectorAll("[data-supsubtab]");
+    for (var i=0;i<subtabs.length;i++){
+      subtabs[i].addEventListener("click", function(){
+        state.supTab = this.getAttribute("data-supsubtab"); renderSuppliesAdmin();
+      });
+    }
+    var acts = sc.querySelectorAll("[data-supstatus]");
+    for (var a=0;a<acts.length;a++){
+      acts[a].addEventListener("click", function(){
+        supSetStatus(this.getAttribute("data-supitem"), this.getAttribute("data-suploc2"), this.getAttribute("data-supstatus"));
+      });
+    }
+    var dels = sc.querySelectorAll("[data-supdel]");
+    for (var dd=0;dd<dels.length;dd++){
+      dels[dd].addEventListener("click", function(){ supDeleteItem(this.getAttribute("data-supdel")); });
+    }
+    var addBtn = sc.querySelector("#sup-add-btn");
+    if (addBtn) addBtn.addEventListener("click", supAddItem);
+  }
+  function supSetStatus(itemId, location, status){
+    fetch("/api/supplies/flag/status", { method:"POST", headers: headers(true),
+      body: JSON.stringify({ itemId:itemId, location:location, status:status }) })
+      .then(function(r){ return r.json(); })
+      .then(function(res){
+        if (res && res.success){
+          state.supData.flags = res.flags;
+          renderSuppliesAdmin();
+          supToast(status==="clear" ? "Cleared" : (status==="confirmed" ? "Confirmed" : "Marked as ordered"));
+        } else { supToast((res&&res.error)||"Could not update"); }
+      })
+      .catch(function(){ supToast("Network error"); });
+  }
+  function supAddItem(){
+    var name = ($("sup-new-name").value || "").trim();
+    var cat = $("sup-new-cat").value;
+    if (!name){ supToast("Enter an item name"); return; }
+    fetch("/api/supplies/items", { method:"POST", headers: headers(true),
+      body: JSON.stringify({ name:name, category:cat }) })
+      .then(function(r){ return r.json(); })
+      .then(function(res){
+        if (res && res.success){ state.supData.items = res.items; renderSuppliesAdmin(); supToast("Item added"); }
+        else { supToast((res&&res.error)||"Could not add item"); }
+      })
+      .catch(function(){ supToast("Network error"); });
+  }
+  function supDeleteItem(id){
+    if (!confirm("Remove this item from the list?")) return;
+    fetch("/api/supplies/items/"+encodeURIComponent(id), { method:"DELETE", headers: headers(false) })
+      .then(function(r){ return r.json(); })
+      .then(function(res){
+        if (res && res.success){ loadSupplies(); supToast("Item removed"); }
+        else { supToast((res&&res.error)||"Could not remove"); }
+      })
+      .catch(function(){ supToast("Network error"); });
+  }
+
   /* ---------- PIN modal ---------- */
   function showPin(){
     state.pinLevel = null; state.pinDigits = "";
@@ -1516,7 +2003,9 @@ const JS_STR = `
           localStorage.setItem("opsAccess", res.level);
           hidePin();
           applyAccess();
-          renderTabs(); loadTeam(); loadPosts();
+          renderTabs();
+          if (state.location === "Supplies"){ showSuppliesView(); } else { showFeedView(); }
+          loadTeam(); loadPosts();
         } else {
           state.pinDigits = "";
           renderDots();
@@ -1587,6 +2076,7 @@ loadData();
 console.log('[OPS] Photos directory: ' + PHOTOS_DIR);
 console.log('[OPS] Team initialized: ' + team.length + ' members');
 console.log('[OPS] Posts loaded: ' + posts.length);
+console.log('[OPS] Supplies items: ' + supplies.items.length);
 server.listen(PORT, function () {
   console.log('[OPS] Running on port ' + PORT);
   console.log('[OPS] Ready — visit /ping to verify');
