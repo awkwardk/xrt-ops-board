@@ -947,6 +947,19 @@ header{position:sticky; top:0; z-index:20; background:#fff;
   border:1.5px solid var(--green); background:#fff; color:var(--green);
   font-weight:600; font-size:14px; white-space:nowrap;}
 .tab.active{background:var(--green); color:#fff;}
+.tab-badge{display:inline-flex; align-items:center; justify-content:center; margin-left:6px;
+  min-width:18px; height:18px; padding:0 5px; border-radius:9px; background:var(--urgent);
+  color:#fff; font-size:11px; font-weight:700; vertical-align:middle;}
+.tab.active .tab-badge{background:#fff; color:var(--urgent);}
+
+/* Admin supplies alert banner */
+.sup-alert{display:flex; align-items:center; gap:10px; margin:10px 12px 0; padding:10px 12px;
+  background:var(--urgent-l); border:1px solid var(--urgent); border-radius:10px;}
+.sup-alert .sa-text{flex:1; font-size:13px; font-weight:600; color:var(--urgent); line-height:1.35;}
+.sup-alert .sa-review{background:var(--urgent); color:#fff; border:none; border-radius:8px;
+  min-height:34px; padding:6px 14px; font-size:12px; font-weight:700; white-space:nowrap;}
+.sup-alert .sa-x{background:none; border:none; color:var(--urgent); font-size:22px; line-height:1;
+  min-width:30px; min-height:30px; padding:0;}
 
 /* Stats */
 .stats{display:flex; gap:8px; padding:12px;}
@@ -1242,6 +1255,7 @@ const BODY_STR = `
   </header>
 
   <div class="tabs" id="tabs"></div>
+  <div id="supAlert" class="sup-alert hidden"></div>
   <div class="stats" id="stats"></div>
   <div class="feed" id="feed"></div>
   <div id="supplies" class="hidden"></div>
@@ -1388,6 +1402,8 @@ const JS_STR = `
     supLocation: "Cole",          // staff supplies location selector
     supData: { items: [], flags: [] },
     supTab: "flagged",            // admin supplies sub-tab
+    supAlertCount: 0,             // admin notification: open flags needing ordering
+    supAlertDismissedAt: 0,       // banner dismissed while count <= this
     sops: [],                     // SOP documents
     sopQuery: "",                 // SOP search text
     sopCat: "All",                // SOP category filter
@@ -1470,7 +1486,12 @@ const JS_STR = `
     for (var i=0;i<locs.length;i++){
       var loc = locs[i];
       var cls = "tab" + (loc===state.location ? " active" : "");
-      html += '<button class="'+cls+'" data-loc="'+loc+'">'+loc+'</button>';
+      var label = loc;
+      // Admin notification: unread count of supplies needing ordering.
+      if (loc === "Supplies" && isAdmin() && state.supAlertCount > 0){
+        label += '<span class="tab-badge">' + state.supAlertCount + '</span>';
+      }
+      html += '<button class="'+cls+'" data-loc="'+loc+'">'+label+'</button>';
     }
     $("tabs").innerHTML = html;
     var btns = $("tabs").querySelectorAll(".tab");
@@ -1497,6 +1518,7 @@ const JS_STR = `
     $("fab").classList.add("hidden");
     $("sops").classList.add("hidden");
     $("supplies").classList.remove("hidden");
+    renderSupAlert();
     loadSupplies();
   }
   function showSopsView(){
@@ -1505,6 +1527,7 @@ const JS_STR = `
     $("fab").classList.add("hidden");
     $("supplies").classList.add("hidden");
     $("sops").classList.remove("hidden");
+    renderSupAlert();
     state.sopDetailId = null;
     loadSops();
   }
@@ -1514,6 +1537,61 @@ const JS_STR = `
     $("stats").classList.remove("hidden");
     $("feed").classList.remove("hidden");
     $("fab").classList.remove("hidden");
+    renderSupAlert();
+  }
+
+  /* ---------- Admin supplies notification ---------- */
+  // "Needs ordering" = flags staff raised (flagged) or admin approved
+  // but not yet ordered (confirmed).
+  function countOpenFlags(flags){
+    if (!Array.isArray(flags)) return 0;
+    return flags.filter(function(f){
+      return f.status === "flagged" || f.status === "confirmed";
+    }).length;
+  }
+  // Refresh the tab badge + banner from a known flags array.
+  function setSupAlert(flags){
+    state.supAlertCount = isAdmin() ? countOpenFlags(flags) : 0;
+    // Track the dismiss floor so the banner re-appears when the count
+    // climbs above where it was last dismissed.
+    if (state.supAlertDismissedAt > state.supAlertCount){
+      state.supAlertDismissedAt = state.supAlertCount;
+    }
+    renderTabs();
+    renderSupAlert();
+  }
+  // Poll the server for the current open-flag count (admins only).
+  function loadSupAlerts(){
+    if (!isAdmin()){ state.supAlertCount = 0; renderTabs(); renderSupAlert(); return; }
+    fetch("/api/supplies")
+      .then(function(r){ return r.json(); })
+      .then(function(d){ setSupAlert(d && d.flags ? d.flags : []); })
+      .catch(function(){});
+  }
+  // The banner only shows to admins, on the posts view, until dismissed.
+  function renderSupAlert(){
+    var el = $("supAlert");
+    if (!el) return;
+    var onFeed = state.location !== "Supplies" && state.location !== "SOPs";
+    var show = isAdmin() && state.supAlertCount > 0 && onFeed &&
+               state.supAlertDismissedAt < state.supAlertCount;
+    if (!show){ el.classList.add("hidden"); el.innerHTML = ""; return; }
+    var n = state.supAlertCount;
+    el.innerHTML =
+      '<span class="sa-text">&#128276; ' + n + ' supply item' + (n === 1 ? "" : "s") +
+        ' need ordering</span>' +
+      '<button class="sa-review">Review</button>' +
+      '<button class="sa-x" title="Dismiss">&times;</button>';
+    el.classList.remove("hidden");
+    el.querySelector(".sa-review").addEventListener("click", function(){
+      state.location = "Supplies";
+      renderTabs();
+      showSuppliesView();
+    });
+    el.querySelector(".sa-x").addEventListener("click", function(){
+      state.supAlertDismissedAt = state.supAlertCount;
+      el.classList.add("hidden");
+    });
   }
 
   /* ---------- Stats ---------- */
@@ -1906,6 +1984,7 @@ const JS_STR = `
       .then(function(data){
         state.supData = (data && Array.isArray(data.items) && Array.isArray(data.flags))
           ? data : { items: [], flags: [] };
+        setSupAlert(state.supData.flags);
         renderSupplies();
       })
       .catch(function(){ renderSupplies(); });
@@ -2116,6 +2195,7 @@ const JS_STR = `
       .then(function(res){
         if (res && res.success){
           state.supData.flags = res.flags;
+          setSupAlert(res.flags);
           renderSuppliesAdmin();
           supToast(status==="clear" ? "Cleared" : (status==="confirmed" ? "Confirmed" : "Marked as ordered"));
         } else { supToast((res&&res.error)||"Could not update"); }
@@ -2463,6 +2543,7 @@ const JS_STR = `
           else if (state.location === "SOPs"){ showSopsView(); }
           else { showFeedView(); }
           loadTeam(); loadPosts();
+          loadSupAlerts();
         } else {
           state.pinDigits = "";
           renderDots();
@@ -2513,9 +2594,12 @@ const JS_STR = `
     if (state.level){
       applyAccess();
       loadTeam(); loadPosts();
+      loadSupAlerts();
     } else {
       showPin();
     }
+    // Poll for admin supply-order notifications (no-op for staff).
+    setInterval(loadSupAlerts, 45000);
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
