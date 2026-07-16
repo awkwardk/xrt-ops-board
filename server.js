@@ -60,15 +60,20 @@ const DEFAULT_SUPPLIES = {
 };
 
 /*
- * SOP (Standard Operating Procedure) documents. Each: title, category,
- * optional sopId, content body, last-updated date. Two placeholders are
+ * XOS (Xtreme Operating System) documents. Each: title, volume,
+ * sortOrder, optional sopId, content body, last-updated date. Volume is
+ * one of V1/V2/V3/HR (UN = temporarily unassigned). Two placeholders are
  * pre-loaded on first run (when no sops.json exists yet).
  */
+const SOP_VOLUMES = ['V1', 'V2', 'V3', 'HR']; // selectable volumes (UN = unassigned fallback)
+
 const DEFAULT_SOPS = [
   {
     id: 'sop-1',
     sopId: 'SOP-001',
     title: 'Electronics Intake Procedure',
+    volume: 'V2',
+    sortOrder: 1,
     category: 'Intake',
     body: 'Purpose: Ensure all incoming electronics are properly received, logged, and staged for processing.\n\nStep 1: Greet the customer and confirm they have a valid pickup or drop-off appointment.\n\nStep 2: Count and record the number of items being dropped off. Note any oversized or hazardous items (CRT monitors, batteries, large printers).\n\nStep 3: Issue the customer a receipt with item count and date. Have them sign if required by location.\n\nStep 4: Stage items in the designated intake area — do not mix with already-processed inventory.\n\nStep 5: Tag the lot with date received and customer reference number if applicable.\n\nStep 6: Notify the processing team that a new intake is staged and ready.\n\nNotes:\n- Never accept items that are leaking, smoking, or show signs of chemical damage\n- Batteries must be placed in the designated battery bin immediately\n- If unsure about an item, ask a supervisor before accepting',
     updated: '2026-06-12'
@@ -77,6 +82,8 @@ const DEFAULT_SOPS = [
     id: 'sop-2',
     sopId: 'SOP-002',
     title: 'Hard Drive Data Destruction',
+    volume: 'V2',
+    sortOrder: 2,
     category: 'Data Destruction',
     body: 'Purpose: Ensure all data-bearing devices are destroyed completely and documented correctly. This SOP has zero tolerance for errors.\n\nStep 1: Identify all data-bearing devices in the lot — hard drives, SSDs, phones, tablets, laptops.\n\nStep 2: Log each device by make, model, and serial number before destruction.\n\nStep 3: Process each device through the approved destruction method for its type:\n- Hard drives: physical shredding or degaussing\n- SSDs and flash storage: physical shredding only (degaussing does not work)\n- Phones and tablets: physical shredding\n\nStep 4: Document destruction completion — note date, time, method, and staff member who performed it.\n\nStep 5: Generate certificate of destruction for the customer if requested.\n\nStep 6: Place destroyed material in the certified destruction bin — do not mix with general e-scrap.\n\nNotes:\n- Never skip logging a device — documentation is legally required\n- If a device cannot be processed immediately, store it in the locked staging area\n- Questions about a specific device type go to the supervisor before proceeding',
     updated: '2026-06-12'
@@ -136,6 +143,19 @@ function loadData() {
   // Missing/corrupt sops.json -> pre-load the two placeholders. An
   // empty array is a valid state (admin removed all) and is kept.
   if (!Array.isArray(sops)) sops = JSON.parse(JSON.stringify(DEFAULT_SOPS));
+  // Normalize every XOS entry to the new schema. Legacy entries without a
+  // volume become 'UN' (Unassigned) with sortOrder 0 until they are mapped.
+  sops = sops.map(function (s) {
+    if (!s || typeof s !== 'object') return s;
+    if (typeof s.volume !== 'string' || ['V1', 'V2', 'V3', 'HR', 'UN'].indexOf(s.volume) === -1) {
+      s.volume = 'UN';
+    }
+    if (typeof s.sortOrder !== 'number' || isNaN(s.sortOrder)) {
+      var n = parseInt(s.sortOrder, 10);
+      s.sortOrder = isNaN(n) ? 0 : n;
+    }
+    return s;
+  });
 
   // Persist a baseline so the JSON files exist on first run.
   saveData();
@@ -721,7 +741,10 @@ function handleCreateSop(req, res) {
     try {
       const body = JSON.parse(buf.toString('utf8') || '{}');
       const title = String(body.title || '').trim();
-      const category = String(body.category || 'General').trim() || 'General';
+      const volRaw = String(body.volume || '').trim();
+      const volume = SOP_VOLUMES.indexOf(volRaw) !== -1 ? volRaw : 'UN';
+      let sortOrder = parseInt(body.sortOrder, 10);
+      if (isNaN(sortOrder)) sortOrder = 0;
       const sopId = String(body.sopId || '').trim();
       const content = String(body.body || '').trim();
       if (!title) return sendJson(res, 400, { success: false, error: 'Title required' });
@@ -730,7 +753,8 @@ function handleCreateSop(req, res) {
         id: 'sop-' + Date.now() + '-' + Math.floor(Math.random() * 10000),
         sopId: sopId,
         title: title,
-        category: category,
+        volume: volume,
+        sortOrder: sortOrder,
         body: content,
         updated: new Date().toISOString().slice(0, 10)
       };
@@ -757,9 +781,16 @@ function handleUpdateSop(req, res, id) {
       if (!title) return sendJson(res, 400, { success: false, error: 'Title required' });
       if (!content) return sendJson(res, 400, { success: false, error: 'Content required' });
       sop.title = title;
-      sop.category = String(body.category || sop.category).trim() || sop.category;
       sop.sopId = String(body.sopId || '').trim();
       sop.body = content;
+      if (body.volume !== undefined) {
+        var v = String(body.volume || '').trim();
+        if (SOP_VOLUMES.indexOf(v) !== -1 || v === 'UN') sop.volume = v;
+      }
+      if (body.sortOrder !== undefined) {
+        var so = parseInt(body.sortOrder, 10);
+        if (!isNaN(so)) sop.sortOrder = so;
+      }
       sop.updated = new Date().toISOString().slice(0, 10);
       saveData('sops');
       sendJson(res, 200, { success: true, sop: sop });
@@ -1190,6 +1221,9 @@ header{position:sticky; top:0; z-index:20; background:#fff;
 .sop-preview{font-size:13px; color:var(--text2); margin-top:6px; line-height:1.5;
   display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden;}
 .sop-highlight{background:var(--green-light); color:var(--green); border-radius:2px; padding:0 2px;}
+.sop-vol-header{font-size:12px; font-weight:700; color:var(--green); text-transform:uppercase;
+  letter-spacing:.6px; margin:14px 0 8px; padding-bottom:4px; border-bottom:1px solid var(--border);}
+.sop-vol-header:first-child{margin-top:2px;}
 .sop-empty{text-align:center; color:var(--text2); padding:28px 16px; font-size:14px;}
 .sop-back{background:none; border:none; color:var(--green); font-size:14px; font-weight:600;
   cursor:pointer; padding:6px 0; margin-bottom:8px; display:flex; align-items:center; gap:6px;
@@ -1404,16 +1438,37 @@ const JS_STR = `
     supTab: "flagged",            // admin supplies sub-tab
     supAlertCount: 0,             // admin notification: open flags needing ordering
     supAlertDismissedAt: 0,       // banner dismissed while count <= this
-    sops: [],                     // SOP documents
-    sopQuery: "",                 // SOP search text
-    sopCat: "All",                // SOP category filter
-    sopDetailId: null,            // open SOP detail
+    sops: [],                     // XOS entries
+    sopQuery: "",                 // XOS search text
+    sopVolume: "V1",              // active Volume tab in browse
+    sopDetailId: null,            // open XOS detail
     sopAdminMode: false,          // admin manage vs browse
-    sopAdminTab: "list",          // admin SOP sub-tab: list | add
-    sopEditId: ""                 // SOP being edited
+    sopAdminTab: "list",          // admin XOS sub-tab: list | add
+    sopEditId: ""                 // XOS entry being edited
   };
   var SUP_LOCS = ["Cole","Dayton","Visalia"];
-  var SOP_CATEGORIES = ["All","Intake","Processing","Data Destruction","Safety","Customer Pickup","Sorting & Grading","Shipping & Fulfillment","Equipment","Compliance","General"];
+  // XOS Volumes. UN (Unassigned) only appears while entries await mapping.
+  var XOS_VOLUMES = [
+    { key:"V1", label:"Volume 1", full:"Volume 1 \\u2014 Culture & Employee Handbook" },
+    { key:"V2", label:"Volume 2", full:"Volume 2 \\u2014 Warehouse Operations" },
+    { key:"V3", label:"Volume 3", full:"Volume 3 \\u2014 Driver & Logistics" },
+    { key:"HR", label:"HR", full:"HR" },
+    { key:"UN", label:"Unassigned", full:"Unassigned" }
+  ];
+  function volLabel(key){
+    for (var i=0;i<XOS_VOLUMES.length;i++){ if (XOS_VOLUMES[i].key===key) return XOS_VOLUMES[i].label; }
+    return key || "Unassigned";
+  }
+  function volFull(key){
+    for (var i=0;i<XOS_VOLUMES.length;i++){ if (XOS_VOLUMES[i].key===key) return XOS_VOLUMES[i].full; }
+    return key || "Unassigned";
+  }
+  function xosSort(list){
+    return list.slice().sort(function(a,b){
+      var d = (a.sortOrder||0) - (b.sortOrder||0);
+      return d !== 0 ? d : String(a.title||"").localeCompare(String(b.title||""));
+    });
+  }
 
   function $(id){ return document.getElementById(id); }
   function esc(s){
@@ -1481,7 +1536,7 @@ const JS_STR = `
     var locs = LOCATIONS.slice();
     if (isAdmin()) locs.push("Management");
     locs.push("Supplies");
-    locs.push("SOPs");
+    locs.push("XOS");
     var html = "";
     for (var i=0;i<locs.length;i++){
       var loc = locs[i];
@@ -1501,7 +1556,7 @@ const JS_STR = `
         renderTabs();
         if (state.location === "Supplies"){
           showSuppliesView();
-        } else if (state.location === "SOPs"){
+        } else if (state.location === "XOS"){
           showSopsView();
         } else {
           showFeedView();
@@ -1572,7 +1627,7 @@ const JS_STR = `
   function renderSupAlert(){
     var el = $("supAlert");
     if (!el) return;
-    var onFeed = state.location !== "Supplies" && state.location !== "SOPs";
+    var onFeed = state.location !== "Supplies" && state.location !== "XOS";
     var show = isAdmin() && state.supAlertCount > 0 && onFeed &&
                state.supAlertDismissedAt < state.supAlertCount;
     if (!show){ el.classList.add("hidden"); el.innerHTML = ""; return; }
@@ -2251,27 +2306,38 @@ const JS_STR = `
     renderSopBrowse();
   }
 
-  /* Browse view — open to all: search, category filter, read. */
+  function volHasEntries(key){
+    return state.sops.some(function(s){ return (s.volume||"UN")===key; });
+  }
+
+  /* Browse view — open to all: search, Volume tabs, read. */
   function renderSopBrowse(){
     var toggle = "";
     if (isAdmin()){
       toggle = '<div class="sop-toggle">'+
-        '<button class="sup-pill active" data-sopmode="browse">Browse SOPs</button>'+
-        '<button class="sup-pill" data-sopmode="manage">Manage SOPs</button></div>';
+        '<button class="sup-pill active" data-sopmode="browse">Browse XOS</button>'+
+        '<button class="sup-pill" data-sopmode="manage">Manage XOS</button></div>';
     }
-    var cats = "";
-    for (var i=0;i<SOP_CATEGORIES.length;i++){
-      var c = SOP_CATEGORIES[i];
-      cats += '<button class="sop-cat-btn'+(c===state.sopCat?" active":"")+'" data-sopcat="'+esc(c)+'">'+esc(c)+'</button>';
+    // Volume tabs: V1-HR always; Unassigned only while entries await mapping.
+    var tabKeys = ["V1","V2","V3","HR"];
+    if (volHasEntries("UN")) tabKeys.push("UN");
+    // Don't land on an empty Volume if another has content.
+    if (!volHasEntries(state.sopVolume)){
+      for (var t=0;t<tabKeys.length;t++){ if (volHasEntries(tabKeys[t])){ state.sopVolume = tabKeys[t]; break; } }
+    }
+    var tabs = "";
+    for (var i=0;i<tabKeys.length;i++){
+      var k = tabKeys[i];
+      tabs += '<button class="sop-cat-btn'+(k===state.sopVolume?" active":"")+'" data-sopvol="'+k+'">'+esc(volLabel(k))+'</button>';
     }
     $("sops").innerHTML = toggle +
       '<div class="sop-search-wrap">'+
         '<svg class="sop-search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>'+
-        '<input type="text" class="sop-search" id="sopSearch" placeholder="Search SOPs by keyword...">'+
+        '<input type="text" class="sop-search" id="sopSearch" placeholder="Search XOS by keyword...">'+
       '</div>'+
-      '<div class="sop-cat-bar" id="sopCatBar">'+cats+'</div>'+
+      '<div class="sop-cat-bar" id="sopVolBar">'+tabs+'</div>'+
       '<div class="sop-list" id="sopList"></div>'+
-      '<div class="sop-empty" id="sopEmpty" style="display:none">No SOPs found. Try a different search or category.</div>';
+      '<div class="sop-empty" id="sopEmpty" style="display:none">No XOS entries found.</div>';
     var input = $("sopSearch");
     input.value = state.sopQuery;
     input.addEventListener("input", function(){ state.sopQuery = this.value; renderSopList(); });
@@ -2282,10 +2348,10 @@ const JS_STR = `
         renderSops();
       });
     }
-    var catBtns = $("sops").querySelectorAll("[data-sopcat]");
-    for (var k=0;k<catBtns.length;k++){
-      catBtns[k].addEventListener("click", function(){
-        state.sopCat = this.getAttribute("data-sopcat");
+    var volBtns = $("sops").querySelectorAll("[data-sopvol]");
+    for (var v=0;v<volBtns.length;v++){
+      volBtns[v].addEventListener("click", function(){
+        state.sopVolume = this.getAttribute("data-sopvol");
         var all = $("sops").querySelectorAll(".sop-cat-btn");
         for (var z=0;z<all.length;z++) all[z].classList.remove("active");
         this.classList.add("active");
@@ -2295,36 +2361,58 @@ const JS_STR = `
     renderSopList();
   }
 
-  /* Only re-renders the result list (keeps search input focus). */
+  function sopCardHtml(s, q){
+    var b = s.body || "";
+    var preview = b.substring(0,120) + (b.length > 120 ? "..." : "");
+    return '<div class="sop-card" data-sopopen="'+esc(s.id)+'">'+
+      '<div class="sop-card-head">'+
+        '<div class="sop-card-title">'+sopHighlight(s.title, q)+'</div>'+
+        '<svg class="sop-chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>'+
+      '</div>'+
+      '<div class="sop-card-meta"><span class="sop-badge">'+esc(volLabel(s.volume||"UN"))+'</span>'+
+        (s.sopId ? '<span class="sop-idtag">'+esc(s.sopId)+'</span>' : '')+'</div>'+
+      '<div class="sop-preview">'+sopHighlight(preview, q)+'</div></div>';
+  }
+
+  /* Only re-renders the result list (keeps search input focus).
+   * With a query: search all Volumes, grouped under Volume headers.
+   * Without: the active Volume tab's entries in sort_order sequence. */
   function renderSopList(){
     var list = $("sopList"), empty = $("sopEmpty");
     if (!list) return;
     var q = (state.sopQuery || "").trim().toLowerCase();
-    var filtered = state.sops.filter(function(s){
-      var catMatch = state.sopCat === "All" || s.category === state.sopCat;
-      var sm = !q ||
-        (s.title && s.title.toLowerCase().indexOf(q) !== -1) ||
-        (s.body && s.body.toLowerCase().indexOf(q) !== -1) ||
-        (s.sopId && s.sopId.toLowerCase().indexOf(q) !== -1) ||
-        (s.category && s.category.toLowerCase().indexOf(q) !== -1);
-      return catMatch && sm;
-    });
-    if (!filtered.length){ list.innerHTML = ""; if (empty) empty.style.display = "block"; return; }
-    if (empty) empty.style.display = "none";
+    var order = ["V1","V2","V3","HR","UN"];
     var html = "";
-    for (var i=0;i<filtered.length;i++){
-      var s = filtered[i];
-      var b = s.body || "";
-      var preview = b.substring(0,120) + (b.length > 120 ? "..." : "");
-      html += '<div class="sop-card" data-sopopen="'+esc(s.id)+'">'+
-        '<div class="sop-card-head">'+
-          '<div class="sop-card-title">'+sopHighlight(s.title, q)+'</div>'+
-          '<svg class="sop-chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="9 18 15 12 9 6"/></svg>'+
-        '</div>'+
-        '<div class="sop-card-meta"><span class="sop-badge">'+esc(s.category)+'</span>'+
-          (s.sopId ? '<span class="sop-idtag">'+esc(s.sopId)+'</span>' : '')+'</div>'+
-        '<div class="sop-preview">'+sopHighlight(preview, q)+'</div></div>';
+    if (q){
+      var any = false;
+      for (var g=0; g<order.length; g++){
+        var vk = order[g];
+        var matches = xosSort(state.sops.filter(function(s){
+          if ((s.volume||"UN") !== vk) return false;
+          return (s.title && s.title.toLowerCase().indexOf(q) !== -1) ||
+                 (s.body && s.body.toLowerCase().indexOf(q) !== -1) ||
+                 (s.sopId && s.sopId.toLowerCase().indexOf(q) !== -1);
+        }));
+        if (!matches.length) continue;
+        any = true;
+        html += '<div class="sop-vol-header">'+esc(volFull(vk))+'</div>';
+        for (var m=0;m<matches.length;m++) html += sopCardHtml(matches[m], q);
+      }
+      if (!any){
+        list.innerHTML = "";
+        if (empty){ empty.textContent = "No XOS entries match your search."; empty.style.display = "block"; }
+        return;
+      }
+    } else {
+      var items = xosSort(state.sops.filter(function(s){ return (s.volume||"UN") === state.sopVolume; }));
+      if (!items.length){
+        list.innerHTML = "";
+        if (empty){ empty.textContent = "No entries in this Volume yet."; empty.style.display = "block"; }
+        return;
+      }
+      for (var i=0;i<items.length;i++) html += sopCardHtml(items[i], "");
     }
+    if (empty) empty.style.display = "none";
     list.innerHTML = html;
     var cards = list.querySelectorAll("[data-sopopen]");
     for (var c=0;c<cards.length;c++){
@@ -2340,11 +2428,11 @@ const JS_STR = `
     if (!s){ state.sopDetailId = null; renderSops(); return; }
     $("sops").innerHTML =
       '<button class="sop-back" id="sopBack">'+
-        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg> Back to SOPs</button>'+
+        '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg> Back to XOS</button>'+
       '<div class="sup-card">'+
         '<div class="sop-detail-title">'+esc(s.title)+'</div>'+
         '<div class="sop-detail-meta">'+
-          '<span class="sop-badge">'+esc(s.category)+'</span>'+
+          '<span class="sop-badge">'+esc(volLabel(s.volume||"UN"))+'</span>'+
           (s.sopId ? '<span class="sop-idtag">'+esc(s.sopId)+'</span>' : '')+
           (s.updated ? '<span class="sop-updated">Updated '+esc(s.updated)+'</span>' : '')+
         '</div>'+
@@ -2356,56 +2444,67 @@ const JS_STR = `
   /* Admin manage view (admins only — gated by the existing admin PIN). */
   function renderSopAdmin(){
     var toggle = '<div class="sop-toggle">'+
-      '<button class="sup-pill" data-sopmode="browse">Browse SOPs</button>'+
-      '<button class="sup-pill active" data-sopmode="manage">Manage SOPs</button></div>';
+      '<button class="sup-pill" data-sopmode="browse">Browse XOS</button>'+
+      '<button class="sup-pill active" data-sopmode="manage">Manage XOS</button></div>';
     var subtabs = '<div class="sup-subtabs">'+
-      '<button class="sup-pill'+(state.sopAdminTab==="list"?" active":"")+'" data-sopadmin="list">All SOPs</button>'+
-      '<button class="sup-pill'+(state.sopAdminTab==="add"?" active":"")+'" data-sopadmin="add">'+(state.sopEditId?"Edit SOP":"Add New SOP")+'</button></div>';
+      '<button class="sup-pill'+(state.sopAdminTab==="list"?" active":"")+'" data-sopadmin="list">All XOS</button>'+
+      '<button class="sup-pill'+(state.sopAdminTab==="add"?" active":"")+'" data-sopadmin="add">'+(state.sopEditId?"Edit Entry":"Add New Entry")+'</button></div>';
     var body = (state.sopAdminTab === "add") ? sopFormHtml() : sopAdminListHtml();
     $("sops").innerHTML = toggle + subtabs + body;
     sopWireAdmin();
   }
   function sopAdminListHtml(){
-    var rows = "";
     if (!state.sops.length){
-      rows = '<div class="sup-empty">No SOPs yet. Use Add New SOP to create the first one.</div>';
-    } else {
-      for (var i=0;i<state.sops.length;i++){
-        var s = state.sops[i];
+      return '<div class="sup-card"><div class="sup-card-title">All XOS entries — edit or remove</div>'+
+        '<div class="sup-empty">No XOS entries yet. Use Add New Entry to create the first one.</div></div>';
+    }
+    var order = ["V1","V2","V3","HR","UN"];
+    var rows = "";
+    for (var g=0; g<order.length; g++){
+      var vk = order[g];
+      var items = xosSort(state.sops.filter(function(s){ return (s.volume||"UN")===vk; }));
+      if (!items.length) continue;
+      rows += '<div class="sop-vol-header">'+esc(volFull(vk))+'</div>';
+      for (var i=0;i<items.length;i++){
+        var s = items[i];
         rows += '<div class="sop-arow">'+
           '<div style="flex:1"><div class="sop-arow-name">'+esc(s.title)+'</div>'+
-          '<div class="sop-arow-cat">'+esc(s.category)+(s.sopId?" &middot; "+esc(s.sopId):"")+'</div></div>'+
+          '<div class="sop-arow-cat">#'+(s.sortOrder||0)+' &middot; '+esc(volLabel(vk))+(s.sopId?" &middot; "+esc(s.sopId):"")+'</div></div>'+
           '<div class="sup-actions">'+
             '<button class="sop-act edit" data-sopedit="'+esc(s.id)+'">Edit</button>'+
             '<button class="sop-act del" data-sopdel="'+esc(s.id)+'">Remove</button>'+
           '</div></div>';
       }
     }
-    return '<div class="sup-card"><div class="sup-card-title">All SOPs — edit or remove</div>'+rows+'</div>';
+    return '<div class="sup-card"><div class="sup-card-title">All XOS entries — edit or remove</div>'+rows+'</div>';
   }
   function sopFormHtml(){
     var editing = state.sopEditId ? state.sops.filter(function(s){ return s.id===state.sopEditId; })[0] : null;
     var t = editing ? editing.title : "";
-    var cat = editing ? editing.category : "Intake";
+    var vol = editing ? (editing.volume||"UN") : "V1";
+    var so = editing ? (editing.sortOrder||0) : "";
     var sid = editing ? (editing.sopId||"") : "";
     var bd = editing ? editing.body : "";
     var opts = "";
-    for (var i=0;i<SOP_CATEGORIES.length;i++){
-      var c = SOP_CATEGORIES[i];
-      if (c === "All") continue;
-      opts += '<option value="'+esc(c)+'"'+(c===cat?" selected":"")+'>'+esc(c)+'</option>';
+    for (var i=0;i<XOS_VOLUMES.length;i++){
+      var vv = XOS_VOLUMES[i];
+      // Only surface the Unassigned option when the entry is already unassigned.
+      if (vv.key === "UN" && vol !== "UN") continue;
+      opts += '<option value="'+vv.key+'"'+(vv.key===vol?" selected":"")+'>'+esc(vv.full)+'</option>';
     }
     return '<div class="sup-card">'+
-      '<div class="sup-card-title">'+(editing?"Edit SOP":"Add new SOP")+'</div>'+
-      '<div class="sop-field"><label>SOP title</label>'+
-        '<input type="text" id="sopfTitle" placeholder="e.g. Electronics Intake Procedure" value="'+esc(t)+'"></div>'+
-      '<div class="sop-field"><label>Category</label><select id="sopfCat">'+opts+'</select></div>'+
-      '<div class="sop-field"><label>SOP ID (optional — e.g. SOP-001)</label>'+
-        '<input type="text" id="sopfId" placeholder="SOP-001" value="'+esc(sid)+'"></div>'+
-      '<div class="sop-field"><label>Content — steps, rules, and notes</label>'+
-        '<textarea id="sopfBody" placeholder="Step 1: ...">'+esc(bd)+'</textarea></div>'+
+      '<div class="sup-card-title">'+(editing?"Edit Entry":"Add new entry")+'</div>'+
+      '<div class="sop-field"><label>Title</label>'+
+        '<input type="text" id="sopfTitle" placeholder="e.g. Company Standards" value="'+esc(t)+'"></div>'+
+      '<div class="sop-field"><label>Volume</label><select id="sopfVol">'+opts+'</select></div>'+
+      '<div class="sop-field"><label>Sort Order (chapter number within the Volume)</label>'+
+        '<input type="number" id="sopfOrder" min="0" step="1" placeholder="1" value="'+esc(String(so))+'"></div>'+
+      '<div class="sop-field"><label>Document ID (optional — e.g. HR-008)</label>'+
+        '<input type="text" id="sopfId" placeholder="HR-008" value="'+esc(sid)+'"></div>'+
+      '<div class="sop-field"><label>Content</label>'+
+        '<textarea id="sopfBody" placeholder="Write the full entry content...">'+esc(bd)+'</textarea></div>'+
       '<div class="sop-form-actions">'+
-        '<button class="sop-save" id="sopSave">Save SOP</button>'+
+        '<button class="sop-save" id="sopSave">Save Entry</button>'+
         '<button class="sop-cancel" id="sopCancel">Cancel</button>'+
       '</div></div>';
   }
@@ -2448,31 +2547,32 @@ const JS_STR = `
   }
   function sopSave(){
     var title = ($("sopfTitle").value || "").trim();
-    var cat = $("sopfCat").value;
+    var vol = $("sopfVol").value;
+    var so = parseInt($("sopfOrder").value, 10); if (isNaN(so)) so = 0;
     var sid = ($("sopfId").value || "").trim();
     var bd = ($("sopfBody").value || "").trim();
     if (!title){ supToast("Please enter a title"); return; }
-    if (!bd){ supToast("Please enter the SOP content"); return; }
+    if (!bd){ supToast("Please enter the content"); return; }
     var editing = !!state.sopEditId;
     var url = editing ? "/api/sops/"+encodeURIComponent(state.sopEditId) : "/api/sops";
     fetch(url, { method: editing ? "PUT" : "POST", headers: headers(true),
-      body: JSON.stringify({ title:title, category:cat, sopId:sid, body:bd }) })
+      body: JSON.stringify({ title:title, volume:vol, sortOrder:so, sopId:sid, body:bd }) })
       .then(function(r){ return r.json(); })
       .then(function(res){
         if (res && res.success){
-          supToast(editing ? "SOP updated" : "SOP added");
+          supToast(editing ? "Entry updated" : "Entry added");
           state.sopEditId = ""; state.sopAdminTab = "list";
           loadSops();
-        } else { supToast((res&&res.error)||"Could not save SOP"); }
+        } else { supToast((res&&res.error)||"Could not save entry"); }
       })
       .catch(function(){ supToast("Network error"); });
   }
   function sopDelete(id){
-    if (!confirm("Remove this SOP? This cannot be undone.")) return;
+    if (!confirm("Remove this entry? This cannot be undone.")) return;
     fetch("/api/sops/"+encodeURIComponent(id), { method:"DELETE", headers: headers(false) })
       .then(function(r){ return r.json(); })
       .then(function(res){
-        if (res && res.success){ supToast("SOP removed"); loadSops(); }
+        if (res && res.success){ supToast("Entry removed"); loadSops(); }
         else { supToast((res&&res.error)||"Could not remove"); }
       })
       .catch(function(){ supToast("Network error"); });
@@ -2540,7 +2640,7 @@ const JS_STR = `
           applyAccess();
           renderTabs();
           if (state.location === "Supplies"){ showSuppliesView(); }
-          else if (state.location === "SOPs"){ showSopsView(); }
+          else if (state.location === "XOS"){ showSopsView(); }
           else { showFeedView(); }
           loadTeam(); loadPosts();
           loadSupAlerts();

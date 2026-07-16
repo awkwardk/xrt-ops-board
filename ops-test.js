@@ -159,20 +159,23 @@ async function run() {
   const sopCreated = await request({
     method: 'POST', path: '/api/sops',
     headers: { 'X-Access-Level': 'admin', 'Content-Type': 'application/json' }
-  }, JSON.stringify({ title: 'Test SOP', category: 'Safety', sopId: 'SOP-TEST', body: 'Wear gloves.' }));
+  }, JSON.stringify({ title: 'Test SOP', volume: 'V2', sortOrder: 5, sopId: 'SOP-TEST', body: 'Wear gloves.' }));
   const sopId = sopCreated.json && sopCreated.json.sop && sopCreated.json.sop.id;
-  check('POST /api/sops (admin) creates a SOP',
-    !!sopId && sopCreated.json.sop.title === 'Test SOP' && !!sopCreated.json.sop.updated,
+  check('POST /api/sops (admin) creates an XOS entry with volume + sortOrder',
+    !!sopId && sopCreated.json.sop.title === 'Test SOP' &&
+    sopCreated.json.sop.volume === 'V2' && sopCreated.json.sop.sortOrder === 5 &&
+    !!sopCreated.json.sop.updated,
     JSON.stringify(sopCreated.json));
 
-  // 11. update with admin header
+  // 11. update with admin header (change volume + sortOrder)
   const sopUpdated = await request({
     method: 'PUT', path: '/api/sops/' + encodeURIComponent(sopId || 'x'),
     headers: { 'X-Access-Level': 'admin', 'Content-Type': 'application/json' }
-  }, JSON.stringify({ title: 'Test SOP Edited', category: 'Safety', sopId: 'SOP-TEST', body: 'Wear gloves and goggles.' }));
-  check('PUT /api/sops/:id (admin) updates a SOP',
+  }, JSON.stringify({ title: 'Test SOP Edited', volume: 'HR', sortOrder: 3, sopId: 'SOP-TEST', body: 'Wear gloves and goggles.' }));
+  check('PUT /api/sops/:id (admin) updates title, volume, and sortOrder',
     sopUpdated.json && sopUpdated.json.success === true &&
-    sopUpdated.json.sop.title === 'Test SOP Edited',
+    sopUpdated.json.sop.title === 'Test SOP Edited' &&
+    sopUpdated.json.sop.volume === 'HR' && sopUpdated.json.sop.sortOrder === 3,
     JSON.stringify(sopUpdated.json));
 
   // 12. auth enforcement: delete without admin header is blocked
