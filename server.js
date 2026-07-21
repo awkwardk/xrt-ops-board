@@ -61,13 +61,13 @@ const DEFAULT_SUPPLIES = {
 
 /*
  * Pickup-needed flags. Same on-disk/lifecycle pattern as supplies
- * flags (flagged by any staff PIN, resolved by admin), but there is
- * no persisted "items" catalog to flag against — each flag records
- * its own location + pallet type directly, chosen from a hardcoded
- * list (PALLET_TYPES), matching the supplies category convention.
+ * flags (flagged by any staff PIN, resolved by admin). Pallet types
+ * are an admin-editable list stored alongside the flags (not a fixed
+ * catalog like supplies items) — each flag snapshots the palletType
+ * string at creation time, so removing a type later never affects
+ * flags already using it.
  */
-const DEFAULT_PICKUPS = { flags: [] };
-const PALLET_TYPES = ['TV Pallet', 'Mixed Pallet', 'Other'];
+const DEFAULT_PICKUPS = { palletTypes: ['TV Pallet', 'Mixed Pallet'], flags: [] };
 
 /*
  * XOS (Xtreme Operating System) documents. Each: title, volume,
@@ -105,7 +105,7 @@ let posts = [];
 let team = [];
 let settings = {};
 let supplies = { items: [], flags: [] };
-let pickups = { flags: [] };
+let pickups = { palletTypes: [], flags: [] };
 let sops = [];
 
 /* Read a JSON file from disk, returning fallback on any problem. */
@@ -154,6 +154,11 @@ function loadData() {
   }
   if (!pickups || typeof pickups !== 'object' || !Array.isArray(pickups.flags)) {
     pickups = JSON.parse(JSON.stringify(DEFAULT_PICKUPS));
+  }
+  // Migrate pre-existing pickups.json (written before palletTypes was
+  // added) without discarding real flags already on disk.
+  if (!Array.isArray(pickups.palletTypes)) {
+    pickups.palletTypes = DEFAULT_PICKUPS.palletTypes.slice();
   }
   // Missing/corrupt sops.json -> pre-load the two placeholders. An
   // empty array is a valid state (admin removed all) and is kept.
@@ -745,14 +750,17 @@ function handleDeleteSupplyItem(req, res, id) {
  *
  * Same pattern as supplies flags: stored on disk in pickups.json via
  * loadData/saveData, staff (or anyone) can raise a flag with no admin
- * check, admin-only to resolve. There is no persisted catalog to pick
- * an itemId from — each flag records location + palletType directly,
- * palletType chosen from the hardcoded PALLET_TYPES list, mirroring
- * the supplies "category" convention exactly.
+ * check, admin-only to resolve. There is no persisted "items" catalog
+ * to reference by id — each flag records location + palletType
+ * directly, palletType chosen from pickups.palletTypes (an admin-
+ * editable list, scoped only to this feature — not a general list-
+ * management system). Flags snapshot the palletType string at
+ * creation time, so removing a type later never affects flags
+ * already using it.
  * ------------------------------------------------------------------ */
 
 function handleGetPickups(req, res) {
-  sendJson(res, 200, { flags: pickups.flags });
+  sendJson(res, 200, { palletTypes: pickups.palletTypes, flags: pickups.flags });
 }
 
 /* Staff (or anyone) raises a pickup-needed flag for a location. */
@@ -762,11 +770,13 @@ function handleFlagPickup(req, res) {
     try {
       const body = JSON.parse(buf.toString('utf8') || '{}');
       const location = String(body.location || '').trim();
-      const palletTypeRaw = String(body.palletType || '').trim();
-      const palletType = PALLET_TYPES.indexOf(palletTypeRaw) !== -1 ? palletTypeRaw : 'Other';
+      const palletType = String(body.palletType || '').trim();
       const note = String(body.note || '').trim().slice(0, 500);
       if (!location) {
         return sendJson(res, 400, { success: false, error: 'Missing location' });
+      }
+      if (pickups.palletTypes.indexOf(palletType) === -1) {
+        return sendJson(res, 400, { success: false, error: 'Invalid pallet type' });
       }
       const flag = {
         id: 'pk-' + Date.now() + '-' + Math.floor(Math.random() * 10000),
@@ -807,6 +817,39 @@ function handlePickupStatus(req, res) {
       sendJson(res, 500, { success: false, error: 'Could not update status' });
     }
   });
+}
+
+/* Admin adds a new pallet type to the pickup-needed list. */
+function handleAddPalletType(req, res) {
+  if (!isAdmin(req)) return sendJson(res, 403, { success: false, error: 'Admin only' });
+  readBody(req, 4 * 1024, function (err, buf) {
+    if (err) return sendJson(res, 400, { success: false, error: err.message });
+    try {
+      const body = JSON.parse(buf.toString('utf8') || '{}');
+      const name = String(body.name || '').trim();
+      if (!name) return sendJson(res, 400, { success: false, error: 'Pallet type name required' });
+      if (pickups.palletTypes.some(function (t) { return t.toLowerCase() === name.toLowerCase(); })) {
+        return sendJson(res, 400, { success: false, error: 'That pallet type already exists' });
+      }
+      pickups.palletTypes.push(name);
+      saveData('pickups');
+      sendJson(res, 200, { success: true, palletTypes: pickups.palletTypes });
+    } catch (e) {
+      sendJson(res, 500, { success: false, error: 'Could not add pallet type' });
+    }
+  });
+}
+
+/* Admin removes a pallet type. Existing flags keep their snapshotted
+ * palletType string untouched — only future flags lose it as an option. */
+function handleDeletePalletType(req, res, name) {
+  if (!isAdmin(req)) return sendJson(res, 403, { success: false, error: 'Admin only' });
+  const target = decodeURIComponent(name);
+  const before = pickups.palletTypes.length;
+  pickups.palletTypes = pickups.palletTypes.filter(function (t) { return t !== target; });
+  if (pickups.palletTypes.length === before) return sendJson(res, 404, { success: false, error: 'Not found' });
+  saveData('pickups');
+  sendJson(res, 200, { success: true, palletTypes: pickups.palletTypes });
 }
 
 /* ------------------------------------------------------------------ *
@@ -984,6 +1027,12 @@ const server = http.createServer(function (req, res) {
     }
     if (pathname === '/api/pickups/flag/status' && method === 'POST') {
       return handlePickupStatus(req, res);
+    }
+    if (pathname === '/api/pickups/types' && method === 'POST') {
+      return handleAddPalletType(req, res);
+    }
+    if ((m = /^\/api\/pickups\/types\/([^/]+)$/.exec(pathname)) && method === 'DELETE') {
+      return handleDeletePalletType(req, res, m[1]);
     }
 
     // SOPs
@@ -1541,7 +1590,8 @@ const JS_STR = `
     pickupLocation: "Cole",       // staff pickup-needed location selector
     pickupPalletType: "TV Pallet",// staff pickup-needed pallet type selector
     pickupNote: "",
-    pickupData: { flags: [] },
+    pickupData: { palletTypes: [], flags: [] },
+    pickupNewType: "",
     pickupAlertCount: 0,          // admin notification: open pickup-needed flags
     pickupAlertDismissedAt: 0,    // banner dismissed while count <= this
     sops: [],                     // XOS entries
@@ -1553,7 +1603,6 @@ const JS_STR = `
     sopEditId: ""                 // XOS entry being edited
   };
   var SUP_LOCS = ["Cole","Dayton","Visalia"];
-  var PALLET_TYPES = ["TV Pallet","Mixed Pallet","Other"];
   // XOS Volumes. UN (Unassigned) only appears while entries await mapping.
   var XOS_VOLUMES = [
     { key:"V1", label:"Volume 1", full:"Volume 1 \\u2014 Culture & Employee Handbook" },
@@ -2466,7 +2515,13 @@ const JS_STR = `
     fetch("/api/pickups")
       .then(function(r){ return r.json(); })
       .then(function(data){
-        state.pickupData = (data && Array.isArray(data.flags)) ? data : { flags: [] };
+        state.pickupData = (data && Array.isArray(data.flags) && Array.isArray(data.palletTypes))
+          ? data : { palletTypes: [], flags: [] };
+        // If the previously-selected type was removed by an admin,
+        // fall back to whatever is first available.
+        if (state.pickupData.palletTypes.indexOf(state.pickupPalletType) === -1){
+          state.pickupPalletType = state.pickupData.palletTypes[0] || "";
+        }
         setPickupAlert(state.pickupData.flags);
         renderPickups();
       })
@@ -2489,9 +2544,10 @@ const JS_STR = `
       var loc = SUP_LOCS[i];
       locBar += '<button class="sup-pill'+(loc===state.pickupLocation?" active":"")+'" data-pickuploc="'+esc(loc)+'">'+esc(loc)+'</button>';
     }
+    var types = state.pickupData.palletTypes;
     var typeOpts = "";
-    for (var t=0;t<PALLET_TYPES.length;t++){
-      var pt = PALLET_TYPES[t];
+    for (var t=0;t<types.length;t++){
+      var pt = types[t];
       typeOpts += '<option value="'+esc(pt)+'"'+(pt===state.pickupPalletType?" selected":"")+'>'+esc(pt)+'</option>';
     }
     var mine = state.pickupData.flags.filter(function(f){ return f.location===state.pickupLocation && f.status==="flagged"; });
@@ -2506,13 +2562,15 @@ const JS_STR = `
     } else {
       mineRows = '<div class="sup-empty">No open pickup requests for this location.</div>';
     }
+    var reportCard = types.length
+      ? '<select id="pickup-new-type">'+typeOpts+'</select>'+
+        '<input type="text" id="pickup-new-note" placeholder="Note (optional)">'+
+        '<button class="btn-primary" id="pickup-add-btn">Report pickup needed</button>'
+      : '<div class="sup-empty">No pallet types configured yet. Ask an admin to add one.</div>';
     $("pickup").innerHTML =
       '<div class="sup-card"><div class="sup-card-title">Location</div>'+
         '<div class="sup-loc-bar">'+locBar+'</div></div>'+
-      '<div class="sup-card"><div class="sup-card-title">Report a pickup needed</div>'+
-        '<select id="pickup-new-type">'+typeOpts+'</select>'+
-        '<input type="text" id="pickup-new-note" placeholder="Note (optional)">'+
-        '<button class="btn-primary" id="pickup-add-btn">Report pickup needed</button></div>'+
+      '<div class="sup-card"><div class="sup-card-title">Report a pickup needed</div>'+reportCard+'</div>'+
       '<div class="sup-card"><div class="sup-card-title">Open requests — '+esc(state.pickupLocation)+'</div>'+
         '<div class="sup-list">'+mineRows+'</div></div>';
     var pills = $("pickup").querySelectorAll("[data-pickuploc]");
@@ -2542,7 +2600,8 @@ const JS_STR = `
       .catch(function(){ pickupToast("Network error"); });
   }
 
-  /* Admin: review open pickup requests and resolve once handled. */
+  /* Admin: review open pickup requests, resolve once handled, and
+   * manage the pallet-type list (scoped only to this feature). */
   function renderPickupsAdmin(){
     var open = state.pickupData.flags.filter(function(f){ return f.status==="flagged"; });
     var summary = '<div class="sup-summary">'+supStat("low", open.length, "Pickups needed")+'</div>';
@@ -2559,11 +2618,62 @@ const JS_STR = `
           '</div></div>';
       }
     }
-    $("pickup").innerHTML = summary + '<div class="sup-card"><div class="sup-card-title">Pickups flagged by staff</div>'+rows+'</div>';
+    var types = state.pickupData.palletTypes;
+    var typeRows = "";
+    if (!types.length){
+      typeRows = '<div class="sup-empty">No pallet types yet.</div>';
+    } else {
+      for (var ti=0;ti<types.length;ti++){
+        typeRows += '<div class="sup-arow"><div class="sup-arow-top">'+
+          '<div style="flex:1"><div class="sup-name">'+esc(types[ti])+'</div></div>'+
+          '<div class="sup-actions"><button class="sup-act del" data-pickuptypedel="'+esc(types[ti])+'">Remove</button></div>'+
+          '</div></div>';
+      }
+    }
+    var typeAddForm = '<div class="sup-add"><div class="sup-card-title" style="margin-bottom:0">Add pallet type</div>'+
+      '<input type="text" id="pickup-newtype-name" placeholder="Pallet type (e.g. Server Pallet)">'+
+      '<button class="btn-primary" id="pickup-addtype-btn">Add pallet type</button></div>';
+    $("pickup").innerHTML = summary +
+      '<div class="sup-card"><div class="sup-card-title">Pickups flagged by staff</div>'+rows+'</div>'+
+      '<div class="sup-card"><div class="sup-card-title">Pallet types</div>'+typeRows+typeAddForm+'</div>';
     var acts = $("pickup").querySelectorAll("[data-pickupresolve]");
     for (var a=0;a<acts.length;a++){
       acts[a].addEventListener("click", function(){ pickupResolve(this.getAttribute("data-pickupresolve")); });
     }
+    var typeDels = $("pickup").querySelectorAll("[data-pickuptypedel]");
+    for (var td=0;td<typeDels.length;td++){
+      typeDels[td].addEventListener("click", function(){ pickupDeleteType(this.getAttribute("data-pickuptypedel")); });
+    }
+    var addTypeBtn = $("pickup-addtype-btn");
+    if (addTypeBtn) addTypeBtn.addEventListener("click", pickupAddType);
+  }
+  function pickupAddType(){
+    var name = ($("pickup-newtype-name").value || "").trim();
+    if (!name){ pickupToast("Enter a pallet type"); return; }
+    fetch("/api/pickups/types", { method:"POST", headers: headers(true),
+      body: JSON.stringify({ name:name }) })
+      .then(function(r){ return r.json(); })
+      .then(function(res){
+        if (res && res.success){
+          state.pickupData.palletTypes = res.palletTypes;
+          renderPickupsAdmin();
+          pickupToast("Pallet type added");
+        } else { pickupToast((res&&res.error)||"Could not add pallet type"); }
+      })
+      .catch(function(){ pickupToast("Network error"); });
+  }
+  function pickupDeleteType(name){
+    if (!confirm('Remove pallet type "'+name+'"? Existing pickup flags using it will be unaffected.')) return;
+    fetch("/api/pickups/types/"+encodeURIComponent(name), { method:"DELETE", headers: headers(false) })
+      .then(function(r){ return r.json(); })
+      .then(function(res){
+        if (res && res.success){
+          state.pickupData.palletTypes = res.palletTypes;
+          renderPickupsAdmin();
+          pickupToast("Pallet type removed");
+        } else { pickupToast((res&&res.error)||"Could not remove pallet type"); }
+      })
+      .catch(function(){ pickupToast("Network error"); });
   }
   function pickupResolve(id){
     fetch("/api/pickups/flag/status", { method:"POST", headers: headers(true),
