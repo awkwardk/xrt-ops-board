@@ -60,6 +60,16 @@ const DEFAULT_SUPPLIES = {
 };
 
 /*
+ * Pickup-needed flags. Same on-disk/lifecycle pattern as supplies
+ * flags (flagged by any staff PIN, resolved by admin), but there is
+ * no persisted "items" catalog to flag against — each flag records
+ * its own location + pallet type directly, chosen from a hardcoded
+ * list (PALLET_TYPES), matching the supplies category convention.
+ */
+const DEFAULT_PICKUPS = { flags: [] };
+const PALLET_TYPES = ['TV Pallet', 'Mixed Pallet', 'Other'];
+
+/*
  * XOS (Xtreme Operating System) documents. Each: title, volume,
  * sortOrder, optional sopId, content body, last-updated date. Volume is
  * one of V1/V2/V3/HR (UN = temporarily unassigned). Two placeholders are
@@ -95,6 +105,7 @@ let posts = [];
 let team = [];
 let settings = {};
 let supplies = { items: [], flags: [] };
+let pickups = { flags: [] };
 let sops = [];
 
 /* Read a JSON file from disk, returning fallback on any problem. */
@@ -129,6 +140,7 @@ function loadData() {
   team = readJsonFile(path.join(DATA_DIR, 'team.json'), DEFAULT_TEAM.slice());
   settings = readJsonFile(path.join(DATA_DIR, 'settings.json'), Object.assign({}, DEFAULT_SETTINGS));
   supplies = readJsonFile(path.join(DATA_DIR, 'supplies.json'), null);
+  pickups = readJsonFile(path.join(DATA_DIR, 'pickups.json'), null);
   sops = readJsonFile(path.join(DATA_DIR, 'sops.json'), null);
 
   if (!Array.isArray(posts)) posts = [];
@@ -139,6 +151,9 @@ function loadData() {
   if (!supplies || typeof supplies !== 'object' ||
       !Array.isArray(supplies.items) || !Array.isArray(supplies.flags)) {
     supplies = JSON.parse(JSON.stringify(DEFAULT_SUPPLIES));
+  }
+  if (!pickups || typeof pickups !== 'object' || !Array.isArray(pickups.flags)) {
+    pickups = JSON.parse(JSON.stringify(DEFAULT_PICKUPS));
   }
   // Missing/corrupt sops.json -> pre-load the two placeholders. An
   // empty array is a valid state (admin removed all) and is kept.
@@ -182,6 +197,9 @@ function saveData(which) {
     }
     if (!which || which === 'supplies') {
       fs.writeFileSync(path.join(DATA_DIR, 'supplies.json'), JSON.stringify(supplies, null, 2));
+    }
+    if (!which || which === 'pickups') {
+      fs.writeFileSync(path.join(DATA_DIR, 'pickups.json'), JSON.stringify(pickups, null, 2));
     }
     if (!which || which === 'sops') {
       fs.writeFileSync(path.join(DATA_DIR, 'sops.json'), JSON.stringify(sops, null, 2));
@@ -723,6 +741,75 @@ function handleDeleteSupplyItem(req, res, id) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Pickup-needed handlers
+ *
+ * Same pattern as supplies flags: stored on disk in pickups.json via
+ * loadData/saveData, staff (or anyone) can raise a flag with no admin
+ * check, admin-only to resolve. There is no persisted catalog to pick
+ * an itemId from — each flag records location + palletType directly,
+ * palletType chosen from the hardcoded PALLET_TYPES list, mirroring
+ * the supplies "category" convention exactly.
+ * ------------------------------------------------------------------ */
+
+function handleGetPickups(req, res) {
+  sendJson(res, 200, { flags: pickups.flags });
+}
+
+/* Staff (or anyone) raises a pickup-needed flag for a location. */
+function handleFlagPickup(req, res) {
+  readBody(req, 16 * 1024, function (err, buf) {
+    if (err) return sendJson(res, 400, { success: false, error: err.message });
+    try {
+      const body = JSON.parse(buf.toString('utf8') || '{}');
+      const location = String(body.location || '').trim();
+      const palletTypeRaw = String(body.palletType || '').trim();
+      const palletType = PALLET_TYPES.indexOf(palletTypeRaw) !== -1 ? palletTypeRaw : 'Other';
+      const note = String(body.note || '').trim().slice(0, 500);
+      if (!location) {
+        return sendJson(res, 400, { success: false, error: 'Missing location' });
+      }
+      const flag = {
+        id: 'pk-' + Date.now() + '-' + Math.floor(Math.random() * 10000),
+        location: location,
+        palletType: palletType,
+        note: note,
+        status: 'flagged',
+        ts: new Date().toISOString()
+      };
+      pickups.flags.push(flag);
+      saveData('pickups');
+      sendJson(res, 200, { success: true, flags: pickups.flags });
+    } catch (e) {
+      sendJson(res, 500, { success: false, error: 'Could not create flag' });
+    }
+  });
+}
+
+/* Admin resolves (clears) a pickup-needed flag once handled. */
+function handlePickupStatus(req, res) {
+  if (!isAdmin(req)) return sendJson(res, 403, { success: false, error: 'Admin only' });
+  readBody(req, 16 * 1024, function (err, buf) {
+    if (err) return sendJson(res, 400, { success: false, error: err.message });
+    try {
+      const body = JSON.parse(buf.toString('utf8') || '{}');
+      const id = String(body.id || '');
+      const status = String(body.status || '').trim();
+      const idx = pickups.flags.findIndex(function (f) { return f.id === id; });
+      if (idx < 0) return sendJson(res, 404, { success: false, error: 'Flag not found' });
+      if (status === 'resolved') {
+        pickups.flags.splice(idx, 1);
+      } else {
+        return sendJson(res, 400, { success: false, error: 'Invalid status' });
+      }
+      saveData('pickups');
+      sendJson(res, 200, { success: true, flags: pickups.flags });
+    } catch (e) {
+      sendJson(res, 500, { success: false, error: 'Could not update status' });
+    }
+  });
+}
+
+/* ------------------------------------------------------------------ *
  * SOP (Standard Operating Procedure) handlers
  *
  * Stored on disk in sops.json. Reading is open (staff search/read
@@ -886,6 +973,17 @@ const server = http.createServer(function (req, res) {
     }
     if ((m = /^\/api\/supplies\/items\/([^/]+)$/.exec(pathname)) && method === 'DELETE') {
       return handleDeleteSupplyItem(req, res, m[1]);
+    }
+
+    // Pickup-needed flags
+    if (pathname === '/api/pickups' && method === 'GET') {
+      return handleGetPickups(req, res);
+    }
+    if (pathname === '/api/pickups/flag' && method === 'POST') {
+      return handleFlagPickup(req, res);
+    }
+    if (pathname === '/api/pickups/flag/status' && method === 'POST') {
+      return handlePickupStatus(req, res);
     }
 
     // SOPs
@@ -1290,10 +1388,12 @@ const BODY_STR = `
 
   <div class="tabs" id="tabs"></div>
   <div id="supAlert" class="sup-alert hidden"></div>
+  <div id="pickupAlert" class="sup-alert hidden"></div>
   <div class="stats" id="stats"></div>
   <div class="feed" id="feed"></div>
   <div id="supplies" class="hidden"></div>
   <div id="sops" class="hidden"></div>
+  <div id="pickup" class="hidden"></div>
 
   <button class="fab" id="fab" title="Add update">+</button>
 </div>
@@ -1438,6 +1538,12 @@ const JS_STR = `
     supTab: "flagged",            // admin supplies sub-tab
     supAlertCount: 0,             // admin notification: open flags needing ordering
     supAlertDismissedAt: 0,       // banner dismissed while count <= this
+    pickupLocation: "Cole",       // staff pickup-needed location selector
+    pickupPalletType: "TV Pallet",// staff pickup-needed pallet type selector
+    pickupNote: "",
+    pickupData: { flags: [] },
+    pickupAlertCount: 0,          // admin notification: open pickup-needed flags
+    pickupAlertDismissedAt: 0,    // banner dismissed while count <= this
     sops: [],                     // XOS entries
     sopQuery: "",                 // XOS search text
     sopVolume: "V1",              // active Volume tab in browse
@@ -1447,6 +1553,7 @@ const JS_STR = `
     sopEditId: ""                 // XOS entry being edited
   };
   var SUP_LOCS = ["Cole","Dayton","Visalia"];
+  var PALLET_TYPES = ["TV Pallet","Mixed Pallet","Other"];
   // XOS Volumes. UN (Unassigned) only appears while entries await mapping.
   var XOS_VOLUMES = [
     { key:"V1", label:"Volume 1", full:"Volume 1 \\u2014 Culture & Employee Handbook" },
@@ -1536,6 +1643,7 @@ const JS_STR = `
     var locs = LOCATIONS.slice();
     if (isAdmin()) locs.push("Management");
     locs.push("Supplies");
+    locs.push("Pickup");
     locs.push("XOS");
     var html = "";
     for (var i=0;i<locs.length;i++){
@@ -1545,6 +1653,10 @@ const JS_STR = `
       // Admin notification: unread count of supplies needing ordering.
       if (loc === "Supplies" && isAdmin() && state.supAlertCount > 0){
         label += '<span class="tab-badge">' + state.supAlertCount + '</span>';
+      }
+      // Admin notification: unread count of open pickup-needed flags.
+      if (loc === "Pickup" && isAdmin() && state.pickupAlertCount > 0){
+        label += '<span class="tab-badge">' + state.pickupAlertCount + '</span>';
       }
       html += '<button class="'+cls+'" data-loc="'+loc+'">'+label+'</button>';
     }
@@ -1556,6 +1668,8 @@ const JS_STR = `
         renderTabs();
         if (state.location === "Supplies"){
           showSuppliesView();
+        } else if (state.location === "Pickup"){
+          showPickupView();
         } else if (state.location === "XOS"){
           showSopsView();
         } else {
@@ -1572,27 +1686,44 @@ const JS_STR = `
     $("feed").classList.add("hidden");
     $("fab").classList.add("hidden");
     $("sops").classList.add("hidden");
+    $("pickup").classList.add("hidden");
     $("supplies").classList.remove("hidden");
     renderSupAlert();
+    renderPickupAlert();
     loadSupplies();
+  }
+  function showPickupView(){
+    $("stats").classList.add("hidden");
+    $("feed").classList.add("hidden");
+    $("fab").classList.add("hidden");
+    $("sops").classList.add("hidden");
+    $("supplies").classList.add("hidden");
+    $("pickup").classList.remove("hidden");
+    renderSupAlert();
+    renderPickupAlert();
+    loadPickups();
   }
   function showSopsView(){
     $("stats").classList.add("hidden");
     $("feed").classList.add("hidden");
     $("fab").classList.add("hidden");
     $("supplies").classList.add("hidden");
+    $("pickup").classList.add("hidden");
     $("sops").classList.remove("hidden");
     renderSupAlert();
+    renderPickupAlert();
     state.sopDetailId = null;
     loadSops();
   }
   function showFeedView(){
     $("supplies").classList.add("hidden");
+    $("pickup").classList.add("hidden");
     $("sops").classList.add("hidden");
     $("stats").classList.remove("hidden");
     $("feed").classList.remove("hidden");
     $("fab").classList.remove("hidden");
     renderSupAlert();
+    renderPickupAlert();
   }
 
   /* ---------- Admin supplies notification ---------- */
@@ -1645,6 +1776,55 @@ const JS_STR = `
     });
     el.querySelector(".sa-x").addEventListener("click", function(){
       state.supAlertDismissedAt = state.supAlertCount;
+      el.classList.add("hidden");
+    });
+  }
+
+  /* ---------- Admin pickup-needed notification ---------- */
+  // Same mechanism as the supplies alert above: any open ("flagged")
+  // pickup-needed entry counts toward the badge/banner until an admin
+  // resolves it.
+  function countOpenPickups(flags){
+    if (!Array.isArray(flags)) return 0;
+    return flags.filter(function(f){ return f.status === "flagged"; }).length;
+  }
+  function setPickupAlert(flags){
+    state.pickupAlertCount = isAdmin() ? countOpenPickups(flags) : 0;
+    if (state.pickupAlertDismissedAt > state.pickupAlertCount){
+      state.pickupAlertDismissedAt = state.pickupAlertCount;
+    }
+    renderTabs();
+    renderPickupAlert();
+  }
+  // Polled by the same interval as loadSupAlerts (see setInterval below).
+  function loadPickupAlerts(){
+    if (!isAdmin()){ state.pickupAlertCount = 0; renderTabs(); renderPickupAlert(); return; }
+    fetch("/api/pickups")
+      .then(function(r){ return r.json(); })
+      .then(function(d){ setPickupAlert(d && d.flags ? d.flags : []); })
+      .catch(function(){});
+  }
+  function renderPickupAlert(){
+    var el = $("pickupAlert");
+    if (!el) return;
+    var onFeed = state.location !== "Supplies" && state.location !== "Pickup" && state.location !== "XOS";
+    var show = isAdmin() && state.pickupAlertCount > 0 && onFeed &&
+               state.pickupAlertDismissedAt < state.pickupAlertCount;
+    if (!show){ el.classList.add("hidden"); el.innerHTML = ""; return; }
+    var n = state.pickupAlertCount;
+    el.innerHTML =
+      '<span class="sa-text">&#128230; ' + n + ' pickup' + (n === 1 ? "" : "s") +
+        ' needed</span>' +
+      '<button class="sa-review">Review</button>' +
+      '<button class="sa-x" title="Dismiss">&times;</button>';
+    el.classList.remove("hidden");
+    el.querySelector(".sa-review").addEventListener("click", function(){
+      state.location = "Pickup";
+      renderTabs();
+      showPickupView();
+    });
+    el.querySelector(".sa-x").addEventListener("click", function(){
+      state.pickupAlertDismissedAt = state.pickupAlertCount;
       el.classList.add("hidden");
     });
   }
@@ -2281,6 +2461,125 @@ const JS_STR = `
       .catch(function(){ supToast("Network error"); });
   }
 
+  /* ---------- Pickup needed ---------- */
+  function loadPickups(){
+    fetch("/api/pickups")
+      .then(function(r){ return r.json(); })
+      .then(function(data){
+        state.pickupData = (data && Array.isArray(data.flags)) ? data : { flags: [] };
+        setPickupAlert(state.pickupData.flags);
+        renderPickups();
+      })
+      .catch(function(){ renderPickups(); });
+  }
+  function pickupToast(msg){
+    var t = $("supToast");
+    t.textContent = msg; t.classList.add("show");
+    setTimeout(function(){ t.classList.remove("show"); }, 1800);
+  }
+  function renderPickups(){
+    if (isAdmin()) renderPickupsAdmin();
+    else renderPickupsStaff();
+  }
+
+  /* Staff: pick a location + pallet type and report a pickup needed. */
+  function renderPickupsStaff(){
+    var locBar = "";
+    for (var i=0;i<SUP_LOCS.length;i++){
+      var loc = SUP_LOCS[i];
+      locBar += '<button class="sup-pill'+(loc===state.pickupLocation?" active":"")+'" data-pickuploc="'+esc(loc)+'">'+esc(loc)+'</button>';
+    }
+    var typeOpts = "";
+    for (var t=0;t<PALLET_TYPES.length;t++){
+      var pt = PALLET_TYPES[t];
+      typeOpts += '<option value="'+esc(pt)+'"'+(pt===state.pickupPalletType?" selected":"")+'>'+esc(pt)+'</option>';
+    }
+    var mine = state.pickupData.flags.filter(function(f){ return f.location===state.pickupLocation && f.status==="flagged"; });
+    var mineRows = "";
+    if (mine.length){
+      for (var k=0;k<mine.length;k++){
+        var f = mine[k];
+        mineRows += '<div class="sup-row flagged"><div style="flex:1"><div class="sup-name">'+esc(f.palletType)+'</div>'+
+          '<div class="sup-cat">'+esc(timeAgo(f.ts))+(f.note?' &middot; '+esc(f.note):'')+'</div></div>'+
+          '<span class="sup-status flagged">Pending</span></div>';
+      }
+    } else {
+      mineRows = '<div class="sup-empty">No open pickup requests for this location.</div>';
+    }
+    $("pickup").innerHTML =
+      '<div class="sup-card"><div class="sup-card-title">Location</div>'+
+        '<div class="sup-loc-bar">'+locBar+'</div></div>'+
+      '<div class="sup-card"><div class="sup-card-title">Report a pickup needed</div>'+
+        '<select id="pickup-new-type">'+typeOpts+'</select>'+
+        '<input type="text" id="pickup-new-note" placeholder="Note (optional)">'+
+        '<button class="btn-primary" id="pickup-add-btn">Report pickup needed</button></div>'+
+      '<div class="sup-card"><div class="sup-card-title">Open requests — '+esc(state.pickupLocation)+'</div>'+
+        '<div class="sup-list">'+mineRows+'</div></div>';
+    var pills = $("pickup").querySelectorAll("[data-pickuploc]");
+    for (var p=0;p<pills.length;p++){
+      pills[p].addEventListener("click", function(){
+        state.pickupLocation = this.getAttribute("data-pickuploc");
+        renderPickupsStaff();
+      });
+    }
+    var addBtn = $("pickup-add-btn");
+    if (addBtn) addBtn.addEventListener("click", pickupAdd);
+  }
+  function pickupAdd(){
+    var type = $("pickup-new-type").value;
+    var note = ($("pickup-new-note").value || "").trim();
+    fetch("/api/pickups/flag", { method:"POST", headers: headers(true),
+      body: JSON.stringify({ location: state.pickupLocation, palletType: type, note: note }) })
+      .then(function(r){ return r.json(); })
+      .then(function(res){
+        if (res && res.success){
+          state.pickupData.flags = res.flags;
+          state.pickupPalletType = type;
+          renderPickups();
+          pickupToast("Reported");
+        } else { pickupToast((res&&res.error)||"Could not report"); }
+      })
+      .catch(function(){ pickupToast("Network error"); });
+  }
+
+  /* Admin: review open pickup requests and resolve once handled. */
+  function renderPickupsAdmin(){
+    var open = state.pickupData.flags.filter(function(f){ return f.status==="flagged"; });
+    var summary = '<div class="sup-summary">'+supStat("low", open.length, "Pickups needed")+'</div>';
+    var rows = "";
+    if (!open.length){
+      rows = '<div class="sup-empty">No pickups needed right now.</div>';
+    } else {
+      for (var i=0;i<open.length;i++){
+        var f = open[i];
+        rows += '<div class="sup-arow"><div class="sup-arow-top">'+
+          '<div style="flex:1"><div class="sup-name">'+esc(f.palletType)+'</div>'+
+          '<div class="sup-loc-tag">'+esc(f.location)+' &middot; '+esc(timeAgo(f.ts))+(f.note?' &middot; '+esc(f.note):'')+'</div></div>'+
+          '<div class="sup-actions"><button class="sup-act clear" data-pickupresolve="'+esc(f.id)+'">Resolve</button></div>'+
+          '</div></div>';
+      }
+    }
+    $("pickup").innerHTML = summary + '<div class="sup-card"><div class="sup-card-title">Pickups flagged by staff</div>'+rows+'</div>';
+    var acts = $("pickup").querySelectorAll("[data-pickupresolve]");
+    for (var a=0;a<acts.length;a++){
+      acts[a].addEventListener("click", function(){ pickupResolve(this.getAttribute("data-pickupresolve")); });
+    }
+  }
+  function pickupResolve(id){
+    fetch("/api/pickups/flag/status", { method:"POST", headers: headers(true),
+      body: JSON.stringify({ id:id, status:"resolved" }) })
+      .then(function(r){ return r.json(); })
+      .then(function(res){
+        if (res && res.success){
+          state.pickupData.flags = res.flags;
+          setPickupAlert(res.flags);
+          renderPickupsAdmin();
+          pickupToast("Resolved");
+        } else { pickupToast((res&&res.error)||"Could not resolve"); }
+      })
+      .catch(function(){ pickupToast("Network error"); });
+  }
+
   /* ---------- SOPs ---------- */
   function loadSops(){
     fetch("/api/sops")
@@ -2640,10 +2939,12 @@ const JS_STR = `
           applyAccess();
           renderTabs();
           if (state.location === "Supplies"){ showSuppliesView(); }
+          else if (state.location === "Pickup"){ showPickupView(); }
           else if (state.location === "XOS"){ showSopsView(); }
           else { showFeedView(); }
           loadTeam(); loadPosts();
           loadSupAlerts();
+          loadPickupAlerts();
         } else {
           state.pinDigits = "";
           renderDots();
@@ -2695,11 +2996,13 @@ const JS_STR = `
       applyAccess();
       loadTeam(); loadPosts();
       loadSupAlerts();
+      loadPickupAlerts();
     } else {
       showPin();
     }
-    // Poll for admin supply-order notifications (no-op for staff).
-    setInterval(loadSupAlerts, 45000);
+    // Poll for admin notifications (no-op for staff): supplies needing
+    // ordering and pickups needing scheduling, same 45s interval.
+    setInterval(function(){ loadSupAlerts(); loadPickupAlerts(); }, 45000);
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
