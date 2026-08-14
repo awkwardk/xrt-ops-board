@@ -75,7 +75,7 @@ const DEFAULT_PICKUPS = { palletTypes: ['TV Pallet', 'Mixed Pallet'], flags: [] 
  * one of V1/V2/V3/HR (UN = temporarily unassigned). Two placeholders are
  * pre-loaded on first run (when no sops.json exists yet).
  */
-const SOP_VOLUMES = ['V1', 'V2', 'V3', 'HR']; // selectable volumes (UN = unassigned fallback)
+const SOP_VOLUMES = ['V1', 'V2', 'V3', 'HR', 'XW']; // selectable volumes (UN = unassigned fallback)
 
 const DEFAULT_SOPS = [
   {
@@ -167,7 +167,7 @@ function loadData() {
   // volume become 'UN' (Unassigned) with sortOrder 0 until they are mapped.
   sops = sops.map(function (s) {
     if (!s || typeof s !== 'object') return s;
-    if (typeof s.volume !== 'string' || ['V1', 'V2', 'V3', 'HR', 'UN'].indexOf(s.volume) === -1) {
+    if (typeof s.volume !== 'string' || ['V1', 'V2', 'V3', 'HR', 'XW', 'UN'].indexOf(s.volume) === -1) {
       s.volume = 'UN';
     }
     if (typeof s.sortOrder !== 'number' || isNaN(s.sortOrder)) {
@@ -1609,6 +1609,7 @@ const JS_STR = `
     { key:"V2", label:"Volume 2", full:"Volume 2 \\u2014 Warehouse Operations" },
     { key:"V3", label:"Volume 3", full:"Volume 3 \\u2014 Driver & Logistics" },
     { key:"HR", label:"HR", full:"HR" },
+    { key:"XW", label:"Xtreme Way", full:"The Xtreme Way" },
     { key:"UN", label:"Unassigned", full:"Unassigned" }
   ];
   function volLabel(key){
@@ -2728,7 +2729,7 @@ const JS_STR = `
         '<button class="sup-pill" data-sopmode="manage">Manage XOS</button></div>';
     }
     // Volume tabs: V1-HR always; Unassigned only while entries await mapping.
-    var tabKeys = ["V1","V2","V3","HR"];
+    var tabKeys = ["V1","V2","V3","HR","XW"];
     if (volHasEntries("UN")) tabKeys.push("UN");
     // Don't land on an empty Volume if another has content.
     if (!volHasEntries(state.sopVolume)){
@@ -2790,7 +2791,7 @@ const JS_STR = `
     var list = $("sopList"), empty = $("sopEmpty");
     if (!list) return;
     var q = (state.sopQuery || "").trim().toLowerCase();
-    var order = ["V1","V2","V3","HR","UN"];
+    var order = ["V1","V2","V3","HR","XW","UN"];
     var html = "";
     if (q){
       var any = false;
@@ -2867,7 +2868,7 @@ const JS_STR = `
       return '<div class="sup-card"><div class="sup-card-title">All XOS entries — edit or remove</div>'+
         '<div class="sup-empty">No XOS entries yet. Use Add New Entry to create the first one.</div></div>';
     }
-    var order = ["V1","V2","V3","HR","UN"];
+    var order = ["V1","V2","V3","HR","XW","UN"];
     var rows = "";
     for (var g=0; g<order.length; g++){
       var vk = order[g];
