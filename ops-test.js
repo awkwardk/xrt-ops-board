@@ -208,18 +208,28 @@ async function run() {
   check('POST /api/tasks without admin header -> blocked',
     tNoAuth.status === 403 && tNoAuth.json && tNoAuth.json.success === false, 'status=' + tNoAuth.status);
 
-  // 16. create with admin header -> status open, fields set
+  // 16. create without createdBy -> blocked (createdBy now required)
+  const tNoCreator = await request({
+    method: 'POST', path: '/api/tasks',
+    headers: { 'X-Access-Level': 'admin', 'Content-Type': 'application/json' }
+  }, JSON.stringify({ title: 'Test task', location: 'Cole' }));
+  check('POST /api/tasks without createdBy -> blocked (required)',
+    tNoCreator.status === 400 && tNoCreator.json && tNoCreator.json.success === false,
+    'status=' + tNoCreator.status + ' ' + JSON.stringify(tNoCreator.json));
+
+  // 17. create with admin header + createdBy -> status open, fields set
   const tCreated = await request({
     method: 'POST', path: '/api/tasks',
     headers: { 'X-Access-Level': 'admin', 'Content-Type': 'application/json' }
-  }, JSON.stringify({ title: 'Test task', location: 'Cole', assignedTo: 'Reese' }));
+  }, JSON.stringify({ title: 'Test task', location: 'Cole', assignedTo: 'Reese', createdBy: 'Manuel' }));
   const taskId = tCreated.json && tCreated.json.task && tCreated.json.task.id;
-  check('POST /api/tasks (admin) creates a task (status open)',
+  check('POST /api/tasks (admin) creates a task (status open, createdBy stored)',
     !!taskId && tCreated.json.task.status === 'open' && tCreated.json.task.location === 'Cole' &&
-    tCreated.json.task.assignedTo === 'Reese' && !!tCreated.json.task.createdAt,
+    tCreated.json.task.assignedTo === 'Reese' && tCreated.json.task.createdBy === 'Manuel' &&
+    !!tCreated.json.task.createdAt,
     JSON.stringify(tCreated.json));
 
-  // 17. start (staff, no admin) -> started + startedBy/At
+  // 18. start (staff, no admin) -> started + startedBy/At
   const tStarted = await request({
     method: 'POST', path: '/api/tasks/' + encodeURIComponent(taskId || 'x') + '/start',
     headers: { 'Content-Type': 'application/json' }

@@ -888,6 +888,7 @@ function handleCreateTask(req, res) {
       const assignedTo = String(body.assignedTo || '').trim().slice(0, 100);
       const createdBy = String(body.createdBy || '').trim().slice(0, 100);
       if (!title) return sendJson(res, 400, { success: false, error: 'Title required' });
+      if (!createdBy) return sendJson(res, 400, { success: false, error: 'Created by required' });
       if (TASK_LOCATIONS.indexOf(location) === -1) {
         return sendJson(res, 400, { success: false, error: 'Invalid location' });
       }
@@ -3042,6 +3043,23 @@ const JS_STR = `
       else $("task-new-assignee-other").classList.add("hidden");
     });
   }
+  // Required "Created by" picker — same location-filtered + Other pattern
+  // as assignee, but mandatory (a task can't be created without a creator).
+  function taskCreatedBySelectHtml(){
+    var mem = taskMembersAt(state.taskCreateLoc);
+    var opts = '<option value="">Created by… (required)</option>';
+    for (var i=0;i<mem.length;i++) opts += '<option value="'+esc(mem[i].name)+'">'+esc(mem[i].name)+'</option>';
+    opts += '<option value="__other__">Other / visiting worker…</option>';
+    return '<select id="task-new-createdby">'+opts+'</select>'+
+      '<input type="text" id="task-new-createdby-other" class="hidden" placeholder="Other name">';
+  }
+  function wireCreatedByOther(){
+    var sel = $("task-new-createdby"); if (!sel) return;
+    sel.addEventListener("change", function(){
+      if (this.value === "__other__") $("task-new-createdby-other").classList.remove("hidden");
+      else $("task-new-createdby-other").classList.add("hidden");
+    });
+  }
   function renderTasksAdmin(){
     var all = state.taskData;
     var openN = all.filter(function(t){ return t.status==="open"; }).length;
@@ -3062,6 +3080,7 @@ const JS_STR = `
         '<input type="text" id="task-new-title" placeholder="Task title (e.g. Break down the returns pallet)">'+
         '<select id="task-new-loc">'+locOpts+'</select>'+
         '<div id="task-assignee-wrap">'+taskAssigneeSelectHtml()+'</div>'+
+        '<div id="task-createdby-wrap">'+taskCreatedBySelectHtml()+'</div>'+
         '<button class="btn-primary" id="task-create-btn">Create task</button>'+
       '</div></div>';
 
@@ -3096,9 +3115,12 @@ const JS_STR = `
     if (lsel) lsel.addEventListener("change", function(){
       state.taskCreateLoc = this.value;
       $("task-assignee-wrap").innerHTML = taskAssigneeSelectHtml();
+      $("task-createdby-wrap").innerHTML = taskCreatedBySelectHtml();
       wireAssigneeOther();
+      wireCreatedByOther();
     });
     wireAssigneeOther();
+    wireCreatedByOther();
     var cbtn = $("task-create-btn"); if (cbtn) cbtn.addEventListener("click", taskCreate);
     var flls = $("tasks").querySelectorAll("[data-taskflloc]");
     for (var a=0;a<flls.length;a++) flls[a].addEventListener("click", function(){ state.taskFilterLoc = this.getAttribute("data-taskflloc"); renderTasksAdmin(); });
@@ -3131,9 +3153,12 @@ const JS_STR = `
     var loc = $("task-new-loc").value;
     var asv = $("task-new-assignee").value;
     var assignedTo = (asv==="__other__") ? ($("task-new-assignee-other").value||"").trim() : asv;
+    var cbv = $("task-new-createdby").value;
+    var createdBy = (cbv==="__other__") ? ($("task-new-createdby-other").value||"").trim() : cbv;
     if (!title){ taskToast("Enter a task title"); return; }
+    if (!createdBy){ taskToast("Select who is creating this task"); return; }
     fetch("/api/tasks", { method:"POST", headers: headers(true),
-      body: JSON.stringify({ title:title, location:loc, assignedTo:assignedTo, createdBy:"" }) })
+      body: JSON.stringify({ title:title, location:loc, assignedTo:assignedTo, createdBy:createdBy }) })
       .then(function(r){ return r.json(); })
       .then(function(res){
         if (res && res.success){ $("task-new-title").value=""; taskToast("Task created"); loadTasks(); }
