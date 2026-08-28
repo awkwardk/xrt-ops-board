@@ -195,6 +195,69 @@ async function run() {
   const sopGone = Array.isArray(sopsAfter.json) && !sopsAfter.json.some(function (s) { return s.id === sopId; });
   check('DELETE /api/sops/:id (admin) removes the SOP',
     sopDel.json && sopDel.json.success === true && sopGone, JSON.stringify(sopDel.json));
+
+  // ---- To-Do Tasks ----
+  // 14. GET /api/tasks returns an array
+  const tasks0 = await request({ path: '/api/tasks' });
+  check('GET /api/tasks returns an array', Array.isArray(tasks0.json), JSON.stringify(tasks0.json));
+
+  // 15. create without admin header -> blocked
+  const tNoAuth = await request({
+    method: 'POST', path: '/api/tasks', headers: { 'Content-Type': 'application/json' }
+  }, JSON.stringify({ title: 'nope', location: 'Cole' }));
+  check('POST /api/tasks without admin header -> blocked',
+    tNoAuth.status === 403 && tNoAuth.json && tNoAuth.json.success === false, 'status=' + tNoAuth.status);
+
+  // 16. create with admin header -> status open, fields set
+  const tCreated = await request({
+    method: 'POST', path: '/api/tasks',
+    headers: { 'X-Access-Level': 'admin', 'Content-Type': 'application/json' }
+  }, JSON.stringify({ title: 'Test task', location: 'Cole', assignedTo: 'Reese' }));
+  const taskId = tCreated.json && tCreated.json.task && tCreated.json.task.id;
+  check('POST /api/tasks (admin) creates a task (status open)',
+    !!taskId && tCreated.json.task.status === 'open' && tCreated.json.task.location === 'Cole' &&
+    tCreated.json.task.assignedTo === 'Reese' && !!tCreated.json.task.createdAt,
+    JSON.stringify(tCreated.json));
+
+  // 17. start (staff, no admin) -> started + startedBy/At
+  const tStarted = await request({
+    method: 'POST', path: '/api/tasks/' + encodeURIComponent(taskId || 'x') + '/start',
+    headers: { 'Content-Type': 'application/json' }
+  }, JSON.stringify({ name: 'Nic' }));
+  check('POST /api/tasks/:id/start (staff) records startedBy/At',
+    tStarted.json && tStarted.json.success === true && tStarted.json.task.status === 'started' &&
+    tStarted.json.task.startedBy === 'Nic' && !!tStarted.json.task.startedAt,
+    JSON.stringify(tStarted.json));
+
+  // 18. finish -> finished + finishedBy/At, and STILL PRESENT (not deleted)
+  const tFinished = await request({
+    method: 'POST', path: '/api/tasks/' + encodeURIComponent(taskId || 'x') + '/finish',
+    headers: { 'Content-Type': 'application/json' }
+  }, JSON.stringify({ name: 'Reese' }));
+  const tasksAfterFinish = await request({ path: '/api/tasks' });
+  const taskStillThere = Array.isArray(tasksAfterFinish.json) &&
+    tasksAfterFinish.json.some(function (t) { return t.id === taskId && t.status === 'finished'; });
+  check('POST /api/tasks/:id/finish records finish AND keeps the record (not deleted)',
+    tFinished.json && tFinished.json.success === true && tFinished.json.task.status === 'finished' &&
+    tFinished.json.task.finishedBy === 'Reese' && !!tFinished.json.task.finishedAt && taskStillThere,
+    JSON.stringify(tFinished.json));
+
+  // 19. delete without admin header -> blocked
+  const tDelNoAuth = await request({
+    method: 'DELETE', path: '/api/tasks/' + encodeURIComponent(taskId || 'x')
+  });
+  check('DELETE /api/tasks/:id without admin header -> blocked',
+    tDelNoAuth.status === 403 && tDelNoAuth.json && tDelNoAuth.json.success === false, 'status=' + tDelNoAuth.status);
+
+  // 20. delete with admin header -> removed (test cleanup)
+  const tDel = await request({
+    method: 'DELETE', path: '/api/tasks/' + encodeURIComponent(taskId || 'x'),
+    headers: { 'X-Access-Level': 'admin' }
+  });
+  const tasksAfterDel = await request({ path: '/api/tasks' });
+  const taskGone = Array.isArray(tasksAfterDel.json) && !tasksAfterDel.json.some(function (t) { return t.id === taskId; });
+  check('DELETE /api/tasks/:id (admin) removes the task',
+    tDel.json && tDel.json.success === true && taskGone, JSON.stringify(tDel.json));
 }
 
 let child;

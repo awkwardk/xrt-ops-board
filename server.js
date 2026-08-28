@@ -107,6 +107,7 @@ let settings = {};
 let supplies = { items: [], flags: [] };
 let pickups = { palletTypes: [], flags: [] };
 let sops = [];
+let tasks = []; // one-off to-do tasks (open -> started -> finished; kept after finish)
 
 /* Read a JSON file from disk, returning fallback on any problem. */
 function readJsonFile(file, fallback) {
@@ -142,6 +143,7 @@ function loadData() {
   supplies = readJsonFile(path.join(DATA_DIR, 'supplies.json'), null);
   pickups = readJsonFile(path.join(DATA_DIR, 'pickups.json'), null);
   sops = readJsonFile(path.join(DATA_DIR, 'sops.json'), null);
+  tasks = readJsonFile(path.join(DATA_DIR, 'tasks.json'), []);
 
   if (!Array.isArray(posts)) posts = [];
   if (!Array.isArray(team)) team = DEFAULT_TEAM.slice();
@@ -160,6 +162,7 @@ function loadData() {
   if (!Array.isArray(pickups.palletTypes)) {
     pickups.palletTypes = DEFAULT_PICKUPS.palletTypes.slice();
   }
+  if (!Array.isArray(tasks)) tasks = [];
   // Missing/corrupt sops.json -> pre-load the two placeholders. An
   // empty array is a valid state (admin removed all) and is kept.
   if (!Array.isArray(sops)) sops = JSON.parse(JSON.stringify(DEFAULT_SOPS));
@@ -208,6 +211,9 @@ function saveData(which) {
     }
     if (!which || which === 'sops') {
       fs.writeFileSync(path.join(DATA_DIR, 'sops.json'), JSON.stringify(sops, null, 2));
+    }
+    if (!which || which === 'tasks') {
+      fs.writeFileSync(path.join(DATA_DIR, 'tasks.json'), JSON.stringify(tasks, null, 2));
     }
   } catch (err) {
     console.error('[OPS] saveData failed:', err.message);
@@ -853,6 +859,121 @@ function handleDeletePalletType(req, res, name) {
 }
 
 /* ------------------------------------------------------------------ *
+ * To-Do Tasks handlers
+ *
+ * One-off tasks created by an admin at a location. Any staff there can
+ * Start (records startedBy/At) and Finish (records finishedBy/At). Unlike
+ * supplies/pickup flags, a task is NEVER deleted on completion — Finish
+ * moves it to 'finished' so the start/finish record stays queryable.
+ * Lifecycle: open -> started -> finished. Multiple open per location.
+ * Reading is open (staff act on tasks); create/delete are admin-only;
+ * start/finish are staff actions (no admin header required).
+ * ------------------------------------------------------------------ */
+
+const TASK_LOCATIONS = ['Cole', 'Dayton', 'Visalia'];
+
+function handleGetTasks(req, res) {
+  sendJson(res, 200, tasks);
+}
+
+/* Admin creates a task, optionally pointed at a specific person. */
+function handleCreateTask(req, res) {
+  if (!isAdmin(req)) return sendJson(res, 403, { success: false, error: 'Admin only' });
+  readBody(req, 16 * 1024, function (err, buf) {
+    if (err) return sendJson(res, 400, { success: false, error: err.message });
+    try {
+      const body = JSON.parse(buf.toString('utf8') || '{}');
+      const title = String(body.title || '').trim().slice(0, 300);
+      const location = String(body.location || '').trim();
+      const assignedTo = String(body.assignedTo || '').trim().slice(0, 100);
+      const createdBy = String(body.createdBy || '').trim().slice(0, 100);
+      if (!title) return sendJson(res, 400, { success: false, error: 'Title required' });
+      if (TASK_LOCATIONS.indexOf(location) === -1) {
+        return sendJson(res, 400, { success: false, error: 'Invalid location' });
+      }
+      const task = {
+        id: 'task-' + Date.now() + '-' + Math.floor(Math.random() * 10000),
+        location: location,
+        title: title,
+        assignedTo: assignedTo,     // optional; anyone at the location can still pick it up
+        status: 'open',             // open -> started -> finished
+        startedBy: '',
+        startedAt: '',
+        finishedBy: '',
+        finishedAt: '',
+        createdBy: createdBy,
+        createdAt: new Date().toISOString()
+      };
+      tasks.push(task);
+      saveData('tasks');
+      sendJson(res, 200, { success: true, task: task });
+    } catch (e) {
+      sendJson(res, 500, { success: false, error: 'Could not create task' });
+    }
+  });
+}
+
+/* Staff (anyone) starts an open task — records who + when. */
+function handleStartTask(req, res, id) {
+  readBody(req, 4 * 1024, function (err, buf) {
+    if (err) return sendJson(res, 400, { success: false, error: err.message });
+    try {
+      const body = JSON.parse(buf.toString('utf8') || '{}');
+      const name = String(body.name || '').trim().slice(0, 100);
+      if (!name) return sendJson(res, 400, { success: false, error: 'Name required' });
+      const task = tasks.find(function (t) { return t.id === id; });
+      if (!task) return sendJson(res, 404, { success: false, error: 'Task not found' });
+      if (task.status !== 'open') {
+        return sendJson(res, 409, { success: false, error: 'Task already started' });
+      }
+      task.status = 'started';
+      task.startedBy = name;
+      task.startedAt = new Date().toISOString();
+      saveData('tasks');
+      sendJson(res, 200, { success: true, task: task });
+    } catch (e) {
+      sendJson(res, 500, { success: false, error: 'Could not start task' });
+    }
+  });
+}
+
+/* Staff (anyone) finishes a started task — records who + when. Does NOT
+ * delete the task; it stays as a completed record. */
+function handleFinishTask(req, res, id) {
+  readBody(req, 4 * 1024, function (err, buf) {
+    if (err) return sendJson(res, 400, { success: false, error: err.message });
+    try {
+      const body = JSON.parse(buf.toString('utf8') || '{}');
+      const name = String(body.name || '').trim().slice(0, 100);
+      if (!name) return sendJson(res, 400, { success: false, error: 'Name required' });
+      const task = tasks.find(function (t) { return t.id === id; });
+      if (!task) return sendJson(res, 404, { success: false, error: 'Task not found' });
+      if (task.status !== 'started') {
+        return sendJson(res, 409, { success: false, error: 'Task is not in progress' });
+      }
+      task.status = 'finished';
+      task.finishedBy = name;
+      task.finishedAt = new Date().toISOString();
+      saveData('tasks');
+      sendJson(res, 200, { success: true, task: task });
+    } catch (e) {
+      sendJson(res, 500, { success: false, error: 'Could not finish task' });
+    }
+  });
+}
+
+/* Admin deletes a task record entirely. */
+function handleDeleteTask(req, res, id) {
+  if (!isAdmin(req)) return sendJson(res, 403, { success: false, error: 'Admin only' });
+  const target = decodeURIComponent(id);
+  const before = tasks.length;
+  tasks = tasks.filter(function (t) { return t.id !== target; });
+  if (tasks.length === before) return sendJson(res, 404, { success: false, error: 'Not found' });
+  saveData('tasks');
+  sendJson(res, 200, { success: true });
+}
+
+/* ------------------------------------------------------------------ *
  * SOP (Standard Operating Procedure) handlers
  *
  * Stored on disk in sops.json. Reading is open (staff search/read
@@ -1033,6 +1154,23 @@ const server = http.createServer(function (req, res) {
     }
     if ((m = /^\/api\/pickups\/types\/([^/]+)$/.exec(pathname)) && method === 'DELETE') {
       return handleDeletePalletType(req, res, m[1]);
+    }
+
+    // To-Do Tasks
+    if (pathname === '/api/tasks' && method === 'GET') {
+      return handleGetTasks(req, res);
+    }
+    if (pathname === '/api/tasks' && method === 'POST') {
+      return handleCreateTask(req, res);
+    }
+    if ((m = /^\/api\/tasks\/([^/]+)\/start$/.exec(pathname)) && method === 'POST') {
+      return handleStartTask(req, res, m[1]);
+    }
+    if ((m = /^\/api\/tasks\/([^/]+)\/finish$/.exec(pathname)) && method === 'POST') {
+      return handleFinishTask(req, res, m[1]);
+    }
+    if ((m = /^\/api\/tasks\/([^/]+)$/.exec(pathname)) && method === 'DELETE') {
+      return handleDeleteTask(req, res, m[1]);
     }
 
     // SOPs
@@ -1438,15 +1576,34 @@ const BODY_STR = `
   <div class="tabs" id="tabs"></div>
   <div id="supAlert" class="sup-alert hidden"></div>
   <div id="pickupAlert" class="sup-alert hidden"></div>
+  <div id="taskAlert" class="sup-alert hidden"></div>
   <div class="stats" id="stats"></div>
   <div class="feed" id="feed"></div>
   <div id="supplies" class="hidden"></div>
   <div id="sops" class="hidden"></div>
   <div id="pickup" class="hidden"></div>
+  <div id="tasks" class="hidden"></div>
 
   <button class="fab" id="fab" title="Add update">+</button>
 </div>
 <div class="sup-toast" id="supToast"></div>
+
+<!-- Task name picker (Start/Finish) -->
+<div class="overlay" id="taskPickerOverlay">
+  <div class="sheet">
+    <h2 id="taskPickerTitle">Who is doing this?</h2>
+    <div class="field">
+      <label>Name</label>
+      <select id="taskPickerSelect"></select>
+    </div>
+    <div class="field hidden" id="taskPickerOtherField">
+      <label>Other / visiting worker name</label>
+      <input type="text" id="taskPickerOther" placeholder="Type a name">
+    </div>
+    <button class="btn-primary" id="taskPickerConfirm">Confirm</button>
+    <button class="btn-text" id="taskPickerCancel">Cancel</button>
+  </div>
+</div>
 
 <!-- Add update modal -->
 <div class="overlay" id="addOverlay">
@@ -1594,6 +1751,14 @@ const JS_STR = `
     pickupNewType: "",
     pickupAlertCount: 0,          // admin notification: open pickup-needed flags
     pickupAlertDismissedAt: 0,    // banner dismissed while count <= this
+    taskData: [],                 // all to-do tasks
+    taskLocation: "Cole",         // staff tasks location selector
+    taskCreateLoc: "Cole",        // admin create-form location (drives assignee picker)
+    taskFilterLoc: "All",         // admin list location filter
+    taskFilterStatus: "open",     // admin list: open | completed
+    taskAlertCount: 0,            // tab badge: admin=all open+started, staff=at their location
+    taskAlertDismissedAt: 0,      // admin banner dismiss floor
+    _taskPickerCb: null,          // pending Start/Finish name-picker callback
     sops: [],                     // XOS entries
     sopQuery: "",                 // XOS search text
     sopVolume: "V1",              // active Volume tab in browse
@@ -1694,6 +1859,7 @@ const JS_STR = `
     if (isAdmin()) locs.push("Management");
     locs.push("Supplies");
     locs.push("Pickup");
+    locs.push("Tasks");
     locs.push("XOS");
     var html = "";
     for (var i=0;i<locs.length;i++){
@@ -1708,6 +1874,10 @@ const JS_STR = `
       if (loc === "Pickup" && isAdmin() && state.pickupAlertCount > 0){
         label += '<span class="tab-badge">' + state.pickupAlertCount + '</span>';
       }
+      // Tasks badge shows for staff too (location-scoped) — a new direction.
+      if (loc === "Tasks" && state.taskAlertCount > 0){
+        label += '<span class="tab-badge">' + state.taskAlertCount + '</span>';
+      }
       html += '<button class="'+cls+'" data-loc="'+loc+'">'+label+'</button>';
     }
     $("tabs").innerHTML = html;
@@ -1720,6 +1890,8 @@ const JS_STR = `
           showSuppliesView();
         } else if (state.location === "Pickup"){
           showPickupView();
+        } else if (state.location === "Tasks"){
+          showTasksView();
         } else if (state.location === "XOS"){
           showSopsView();
         } else {
@@ -1731,49 +1903,56 @@ const JS_STR = `
   }
 
   // Toggle between the normal posts view and the special tab views.
+  function hideAllSpecial(){
+    $("supplies").classList.add("hidden");
+    $("pickup").classList.add("hidden");
+    $("sops").classList.add("hidden");
+    $("tasks").classList.add("hidden");
+  }
+  function refreshAlerts(){ renderSupAlert(); renderPickupAlert(); renderTaskAlert(); }
   function showSuppliesView(){
     $("stats").classList.add("hidden");
     $("feed").classList.add("hidden");
     $("fab").classList.add("hidden");
-    $("sops").classList.add("hidden");
-    $("pickup").classList.add("hidden");
+    hideAllSpecial();
     $("supplies").classList.remove("hidden");
-    renderSupAlert();
-    renderPickupAlert();
+    refreshAlerts();
     loadSupplies();
   }
   function showPickupView(){
     $("stats").classList.add("hidden");
     $("feed").classList.add("hidden");
     $("fab").classList.add("hidden");
-    $("sops").classList.add("hidden");
-    $("supplies").classList.add("hidden");
+    hideAllSpecial();
     $("pickup").classList.remove("hidden");
-    renderSupAlert();
-    renderPickupAlert();
+    refreshAlerts();
     loadPickups();
+  }
+  function showTasksView(){
+    $("stats").classList.add("hidden");
+    $("feed").classList.add("hidden");
+    $("fab").classList.add("hidden");
+    hideAllSpecial();
+    $("tasks").classList.remove("hidden");
+    refreshAlerts();
+    loadTasks();
   }
   function showSopsView(){
     $("stats").classList.add("hidden");
     $("feed").classList.add("hidden");
     $("fab").classList.add("hidden");
-    $("supplies").classList.add("hidden");
-    $("pickup").classList.add("hidden");
+    hideAllSpecial();
     $("sops").classList.remove("hidden");
-    renderSupAlert();
-    renderPickupAlert();
+    refreshAlerts();
     state.sopDetailId = null;
     loadSops();
   }
   function showFeedView(){
-    $("supplies").classList.add("hidden");
-    $("pickup").classList.add("hidden");
-    $("sops").classList.add("hidden");
+    hideAllSpecial();
     $("stats").classList.remove("hidden");
     $("feed").classList.remove("hidden");
     $("fab").classList.remove("hidden");
-    renderSupAlert();
-    renderPickupAlert();
+    refreshAlerts();
   }
 
   /* ---------- Admin supplies notification ---------- */
@@ -1875,6 +2054,61 @@ const JS_STR = `
     });
     el.querySelector(".sa-x").addEventListener("click", function(){
       state.pickupAlertDismissedAt = state.pickupAlertCount;
+      el.classList.add("hidden");
+    });
+  }
+
+  /* ---------- To-Do Tasks notification ---------- */
+  // "Open" = not yet finished (status open or started). Admin badge counts
+  // all locations; the staff badge is location-scoped (a new direction —
+  // staff badges didn't exist before). Both come from one poll, no 2nd loop.
+  function countOpenTasks(list, location){
+    if (!Array.isArray(list)) return 0;
+    return list.filter(function(t){
+      var openish = (t.status === "open" || t.status === "started");
+      return openish && (!location || t.location === location);
+    }).length;
+  }
+  function setTaskAlert(list){
+    state.taskData = Array.isArray(list) ? list : state.taskData;
+    state.taskAlertCount = isAdmin()
+      ? countOpenTasks(state.taskData)
+      : countOpenTasks(state.taskData, state.taskLocation);
+    if (state.taskAlertDismissedAt > state.taskAlertCount){
+      state.taskAlertDismissedAt = state.taskAlertCount;
+    }
+    renderTabs();
+    renderTaskAlert();
+  }
+  // Runs for admin AND staff (staff get the location-scoped badge).
+  function loadTaskAlerts(){
+    fetch("/api/tasks")
+      .then(function(r){ return r.json(); })
+      .then(function(list){ setTaskAlert(Array.isArray(list) ? list : []); })
+      .catch(function(){});
+  }
+  // Admin-only banner (staff get the tab badge only), on the posts view.
+  function renderTaskAlert(){
+    var el = $("taskAlert");
+    if (!el) return;
+    var onFeed = state.location !== "Supplies" && state.location !== "Pickup" &&
+                 state.location !== "Tasks" && state.location !== "XOS";
+    var show = isAdmin() && state.taskAlertCount > 0 && onFeed &&
+               state.taskAlertDismissedAt < state.taskAlertCount;
+    if (!show){ el.classList.add("hidden"); el.innerHTML = ""; return; }
+    var n = state.taskAlertCount;
+    el.innerHTML =
+      '<span class="sa-text">&#9989; ' + n + ' open task' + (n === 1 ? "" : "s") + '</span>' +
+      '<button class="sa-review">Review</button>' +
+      '<button class="sa-x" title="Dismiss">&times;</button>';
+    el.classList.remove("hidden");
+    el.querySelector(".sa-review").addEventListener("click", function(){
+      state.location = "Tasks";
+      renderTabs();
+      showTasksView();
+    });
+    el.querySelector(".sa-x").addEventListener("click", function(){
+      state.taskAlertDismissedAt = state.taskAlertCount;
       el.classList.add("hidden");
     });
   }
@@ -2691,6 +2925,272 @@ const JS_STR = `
       .catch(function(){ pickupToast("Network error"); });
   }
 
+  /* ---------- To-Do Tasks ---------- */
+  function taskToast(msg){
+    var t = $("supToast");
+    t.textContent = msg; t.classList.add("show");
+    setTimeout(function(){ t.classList.remove("show"); }, 1800);
+  }
+  function taskMembersAt(location){
+    return state.team.filter(function(m){ return m.location === location; });
+  }
+  function fmtDuration(startIso, endIso){
+    if (!startIso || !endIso) return "";
+    var ms = new Date(endIso).getTime() - new Date(startIso).getTime();
+    if (isNaN(ms) || ms < 0) return "";
+    var mins = Math.round(ms/60000);
+    if (mins < 1) return "under 1m";
+    if (mins < 60) return mins + "m";
+    var h = Math.floor(mins/60), m = mins%60;
+    return h + "h" + (m ? (" " + m + "m") : "");
+  }
+  function shortDateTime(iso){
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return "";
+    var months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    var h = d.getHours(), m = d.getMinutes();
+    var ap = h >= 12 ? "PM" : "AM"; var hh = h % 12; if (hh === 0) hh = 12;
+    var mm = m < 10 ? ("0" + m) : ("" + m);
+    return months[d.getMonth()] + " " + d.getDate() + ", " + hh + ":" + mm + " " + ap;
+  }
+  function loadTasks(){
+    fetch("/api/tasks")
+      .then(function(r){ return r.json(); })
+      .then(function(list){
+        state.taskData = Array.isArray(list) ? list : [];
+        setTaskAlert(state.taskData);
+        renderTasks();
+      })
+      .catch(function(){ renderTasks(); });
+  }
+  function renderTasks(){
+    if (isAdmin()) renderTasksAdmin();
+    else renderTasksStaff();
+  }
+  function wireTaskActions(){
+    var c = $("tasks");
+    var starts = c.querySelectorAll("[data-taskstart]");
+    for (var i=0;i<starts.length;i++) starts[i].addEventListener("click", function(){ taskStart(this.getAttribute("data-taskstart")); });
+    var fins = c.querySelectorAll("[data-taskfinish]");
+    for (var j=0;j<fins.length;j++) fins[j].addEventListener("click", function(){ taskFinish(this.getAttribute("data-taskfinish")); });
+    var dels = c.querySelectorAll("[data-taskdel]");
+    for (var d=0;d<dels.length;d++) dels[d].addEventListener("click", function(){ taskDelete(this.getAttribute("data-taskdel")); });
+  }
+
+  /* Staff: pick a location, see its open/started tasks, Start / Finish them. */
+  function renderTasksStaff(){
+    var locBar = "";
+    for (var i=0;i<SUP_LOCS.length;i++){
+      var loc = SUP_LOCS[i];
+      locBar += '<button class="sup-pill'+(loc===state.taskLocation?" active":"")+'" data-taskloc="'+esc(loc)+'">'+esc(loc)+'</button>';
+    }
+    var mine = state.taskData.filter(function(t){
+      return t.location===state.taskLocation && (t.status==="open" || t.status==="started");
+    });
+    mine.sort(function(a,b){
+      var rank = function(s){ return s==="open" ? 0 : 1; };
+      var d = rank(a.status) - rank(b.status);
+      if (d !== 0) return d;
+      return new Date(a.createdAt) - new Date(b.createdAt);
+    });
+    var rows = mine.length ? "" : '<div class="sup-empty">No open tasks for this location.</div>';
+    for (var k=0;k<mine.length;k++) rows += taskStaffRow(mine[k]);
+    $("tasks").innerHTML =
+      '<div class="sup-card"><div class="sup-card-title">Location</div>'+
+        '<div class="sup-loc-bar">'+locBar+'</div></div>'+
+      '<div class="sup-card"><div class="sup-card-title">Open tasks — '+esc(state.taskLocation)+'</div>'+
+        '<div class="sup-list">'+rows+'</div></div>';
+    var pills = $("tasks").querySelectorAll("[data-taskloc]");
+    for (var p=0;p<pills.length;p++){
+      pills[p].addEventListener("click", function(){
+        state.taskLocation = this.getAttribute("data-taskloc");
+        setTaskAlert(state.taskData); // recompute the location-scoped staff badge
+        renderTasksStaff();
+      });
+    }
+    wireTaskActions();
+  }
+  function taskStaffRow(t){
+    var sc = t.status==="started" ? "confirmed" : "flagged";
+    var st = t.status==="started" ? "In progress" : "Open";
+    var meta = [];
+    if (t.assignedTo) meta.push("for " + esc(t.assignedTo));
+    meta.push("added " + esc(timeAgo(t.createdAt)));
+    if (t.status==="started") meta.push("started by " + esc(t.startedBy) + " " + esc(timeAgo(t.startedAt)));
+    var btn = t.status==="open"
+      ? '<button class="sup-act order" data-taskstart="'+esc(t.id)+'">Start</button>'
+      : '<button class="sup-act confirm" data-taskfinish="'+esc(t.id)+'">Finish</button>';
+    return '<div class="sup-row '+sc+'"><div style="flex:1">'+
+      '<div class="sup-name">'+esc(t.title)+'</div>'+
+      '<div class="sup-cat">'+meta.join(" &middot; ")+'</div></div>'+
+      '<span class="sup-status '+sc+'">'+st+'</span>'+btn+'</div>';
+  }
+
+  /* Admin: create tasks + full list with location + open/completed filters. */
+  function taskAssigneeSelectHtml(){
+    var mem = taskMembersAt(state.taskCreateLoc);
+    var opts = '<option value="">Assign to… (optional)</option>';
+    for (var i=0;i<mem.length;i++) opts += '<option value="'+esc(mem[i].name)+'">'+esc(mem[i].name)+'</option>';
+    opts += '<option value="__other__">Other / visiting worker…</option>';
+    return '<select id="task-new-assignee">'+opts+'</select>'+
+      '<input type="text" id="task-new-assignee-other" class="hidden" placeholder="Other name">';
+  }
+  function wireAssigneeOther(){
+    var sel = $("task-new-assignee"); if (!sel) return;
+    sel.addEventListener("change", function(){
+      if (this.value === "__other__") $("task-new-assignee-other").classList.remove("hidden");
+      else $("task-new-assignee-other").classList.add("hidden");
+    });
+  }
+  function renderTasksAdmin(){
+    var all = state.taskData;
+    var openN = all.filter(function(t){ return t.status==="open"; }).length;
+    var startedN = all.filter(function(t){ return t.status==="started"; }).length;
+    var finishedN = all.filter(function(t){ return t.status==="finished"; }).length;
+    var summary = '<div class="sup-summary">'+
+      supStat("low", openN, "Open")+
+      supStat("confirmed", startedN, "In progress")+
+      supStat("ordered", finishedN, "Completed")+
+      supStat("total", all.length, "Total")+'</div>';
+
+    var locOpts = "";
+    for (var i=0;i<SUP_LOCS.length;i++){
+      locOpts += '<option value="'+esc(SUP_LOCS[i])+'"'+(SUP_LOCS[i]===state.taskCreateLoc?" selected":"")+'>'+esc(SUP_LOCS[i])+'</option>';
+    }
+    var createForm = '<div class="sup-card"><div class="sup-card-title">Create a task</div>'+
+      '<div class="sup-add">'+
+        '<input type="text" id="task-new-title" placeholder="Task title (e.g. Break down the returns pallet)">'+
+        '<select id="task-new-loc">'+locOpts+'</select>'+
+        '<div id="task-assignee-wrap">'+taskAssigneeSelectHtml()+'</div>'+
+        '<button class="btn-primary" id="task-create-btn">Create task</button>'+
+      '</div></div>';
+
+    var filterLocs = ["All"].concat(SUP_LOCS);
+    var locFilter = "";
+    for (var fl=0;fl<filterLocs.length;fl++){
+      var L = filterLocs[fl];
+      locFilter += '<button class="sup-pill'+(L===state.taskFilterLoc?" active":"")+'" data-taskflloc="'+esc(L)+'">'+esc(L)+'</button>';
+    }
+    var statusFilter =
+      '<button class="sup-pill'+(state.taskFilterStatus==="open"?" active":"")+'" data-taskflst="open">Open</button>'+
+      '<button class="sup-pill'+(state.taskFilterStatus==="completed"?" active":"")+'" data-taskflst="completed">Completed</button>';
+
+    var list = all.filter(function(t){
+      var locOk = state.taskFilterLoc==="All" || t.location===state.taskFilterLoc;
+      var stOk = state.taskFilterStatus==="open"
+        ? (t.status==="open" || t.status==="started")
+        : (t.status==="finished");
+      return locOk && stOk;
+    });
+    list.sort(function(a,b){ return new Date(b.createdAt) - new Date(a.createdAt); });
+    var rows = list.length ? "" : '<div class="sup-empty">No tasks match this filter.</div>';
+    for (var r=0;r<list.length;r++) rows += taskAdminRow(list[r]);
+
+    $("tasks").innerHTML = summary + createForm +
+      '<div class="sup-card"><div class="sup-card-title">Tasks</div>'+
+        '<div class="sup-loc-bar" style="margin-bottom:8px">'+locFilter+'</div>'+
+        '<div class="sup-loc-bar" style="margin-bottom:10px">'+statusFilter+'</div>'+
+        rows+'</div>';
+
+    var lsel = $("task-new-loc");
+    if (lsel) lsel.addEventListener("change", function(){
+      state.taskCreateLoc = this.value;
+      $("task-assignee-wrap").innerHTML = taskAssigneeSelectHtml();
+      wireAssigneeOther();
+    });
+    wireAssigneeOther();
+    var cbtn = $("task-create-btn"); if (cbtn) cbtn.addEventListener("click", taskCreate);
+    var flls = $("tasks").querySelectorAll("[data-taskflloc]");
+    for (var a=0;a<flls.length;a++) flls[a].addEventListener("click", function(){ state.taskFilterLoc = this.getAttribute("data-taskflloc"); renderTasksAdmin(); });
+    var flss = $("tasks").querySelectorAll("[data-taskflst]");
+    for (var b=0;b<flss.length;b++) flss[b].addEventListener("click", function(){ state.taskFilterStatus = this.getAttribute("data-taskflst"); renderTasksAdmin(); });
+    wireTaskActions();
+  }
+  function taskAdminRow(t){
+    var sc = t.status==="finished" ? "ordered" : (t.status==="started" ? "confirmed" : "flagged");
+    var stLabel = t.status==="finished" ? "Finished" : (t.status==="started" ? "In progress" : "Open");
+    var lines = [];
+    lines.push(esc(t.location) + (t.assignedTo ? " &middot; for " + esc(t.assignedTo) : ""));
+    lines.push("Added " + esc(timeAgo(t.createdAt)) + (t.createdBy ? " by " + esc(t.createdBy) : ""));
+    if (t.startedAt) lines.push("Started by " + esc(t.startedBy) + " &middot; " + esc(shortDateTime(t.startedAt)));
+    if (t.finishedAt) lines.push("Finished by " + esc(t.finishedBy) + " &middot; " + esc(shortDateTime(t.finishedAt)));
+    var dur = fmtDuration(t.startedAt, t.finishedAt);
+    if (dur) lines.push("Duration: " + esc(dur));
+    var actions = "";
+    if (t.status==="open") actions += '<button class="sup-act order" data-taskstart="'+esc(t.id)+'">Start</button>';
+    if (t.status==="started") actions += '<button class="sup-act confirm" data-taskfinish="'+esc(t.id)+'">Finish</button>';
+    actions += '<button class="sup-act del" data-taskdel="'+esc(t.id)+'">Delete</button>';
+    return '<div class="sup-arow"><div class="sup-arow-top">'+
+      '<div style="flex:1"><div class="sup-name">'+esc(t.title)+'</div>'+
+      '<div class="sup-loc-tag">'+lines.join("<br>")+'</div></div>'+
+      '<span class="sup-status '+sc+'">'+stLabel+'</span></div>'+
+      '<div class="sup-actions" style="margin-top:8px">'+actions+'</div></div>';
+  }
+  function taskCreate(){
+    var title = ($("task-new-title").value || "").trim();
+    var loc = $("task-new-loc").value;
+    var asv = $("task-new-assignee").value;
+    var assignedTo = (asv==="__other__") ? ($("task-new-assignee-other").value||"").trim() : asv;
+    if (!title){ taskToast("Enter a task title"); return; }
+    fetch("/api/tasks", { method:"POST", headers: headers(true),
+      body: JSON.stringify({ title:title, location:loc, assignedTo:assignedTo, createdBy:"" }) })
+      .then(function(r){ return r.json(); })
+      .then(function(res){
+        if (res && res.success){ $("task-new-title").value=""; taskToast("Task created"); loadTasks(); }
+        else taskToast((res&&res.error)||"Could not create task");
+      })
+      .catch(function(){ taskToast("Network error"); });
+  }
+  function taskDelete(id){
+    if (!confirm("Delete this task record? This cannot be undone.")) return;
+    fetch("/api/tasks/"+encodeURIComponent(id), { method:"DELETE", headers: headers(false) })
+      .then(function(r){ return r.json(); })
+      .then(function(res){ if (res && res.success){ taskToast("Deleted"); loadTasks(); } else taskToast((res&&res.error)||"Could not delete"); })
+      .catch(function(){ taskToast("Network error"); });
+  }
+  function taskStart(id){
+    var t = state.taskData.filter(function(x){ return x.id===id; })[0]; if (!t) return;
+    openTaskPicker(t.location, "Who is starting this task?", function(name){
+      fetch("/api/tasks/"+encodeURIComponent(id)+"/start", { method:"POST", headers: headers(true),
+        body: JSON.stringify({ name:name }) })
+        .then(function(r){ return r.json(); })
+        .then(function(res){ if (res && res.success){ taskToast("Started"); loadTasks(); } else taskToast((res&&res.error)||"Could not start"); })
+        .catch(function(){ taskToast("Network error"); });
+    });
+  }
+  function taskFinish(id){
+    var t = state.taskData.filter(function(x){ return x.id===id; })[0]; if (!t) return;
+    openTaskPicker(t.location, "Who is finishing this task?", function(name){
+      fetch("/api/tasks/"+encodeURIComponent(id)+"/finish", { method:"POST", headers: headers(true),
+        body: JSON.stringify({ name:name }) })
+        .then(function(r){ return r.json(); })
+        .then(function(res){ if (res && res.success){ taskToast("Finished"); loadTasks(); } else taskToast((res&&res.error)||"Could not finish"); })
+        .catch(function(){ taskToast("Network error"); });
+    });
+  }
+  // Name picker filtered to the task's location, with a free-text fallback
+  // (not a hard lock-out — "Other / visiting worker" always available).
+  function openTaskPicker(location, promptText, cb){
+    state._taskPickerCb = cb;
+    $("taskPickerTitle").textContent = promptText;
+    var mem = taskMembersAt(location);
+    var opts = '<option value="">Select name…</option>';
+    for (var i=0;i<mem.length;i++) opts += '<option value="'+esc(mem[i].name)+'">'+esc(mem[i].name)+'</option>';
+    opts += '<option value="__other__">Other / visiting worker…</option>';
+    $("taskPickerSelect").innerHTML = opts;
+    $("taskPickerOther").value = "";
+    $("taskPickerOtherField").classList.add("hidden");
+    $("taskPickerOverlay").classList.add("show");
+  }
+  function taskPickerConfirm(){
+    var v = $("taskPickerSelect").value;
+    var name = (v==="__other__") ? ($("taskPickerOther").value||"").trim() : v;
+    if (!name){ taskToast("Pick or type a name"); return; }
+    $("taskPickerOverlay").classList.remove("show");
+    var cb = state._taskPickerCb; state._taskPickerCb = null;
+    if (cb) cb(name);
+  }
+
   /* ---------- SOPs ---------- */
   function loadSops(){
     fetch("/api/sops")
@@ -3051,11 +3551,13 @@ const JS_STR = `
           renderTabs();
           if (state.location === "Supplies"){ showSuppliesView(); }
           else if (state.location === "Pickup"){ showPickupView(); }
+          else if (state.location === "Tasks"){ showTasksView(); }
           else if (state.location === "XOS"){ showSopsView(); }
           else { showFeedView(); }
           loadTeam(); loadPosts();
           loadSupAlerts();
           loadPickupAlerts();
+          loadTaskAlerts();
         } else {
           state.pinDigits = "";
           renderDots();
@@ -3094,6 +3596,15 @@ const JS_STR = `
     $("lbClose").addEventListener("click", closeLightbox);
     $("lightbox").addEventListener("click", function(e){ if (e.target===this) closeLightbox(); });
 
+    // Task name-picker (Start/Finish) wiring.
+    $("taskPickerSelect").addEventListener("change", function(){
+      if (this.value === "__other__") $("taskPickerOtherField").classList.remove("hidden");
+      else $("taskPickerOtherField").classList.add("hidden");
+    });
+    $("taskPickerConfirm").addEventListener("click", taskPickerConfirm);
+    $("taskPickerCancel").addEventListener("click", function(){ $("taskPickerOverlay").classList.remove("show"); state._taskPickerCb = null; });
+    $("taskPickerOverlay").addEventListener("click", function(e){ if (e.target===this){ $("taskPickerOverlay").classList.remove("show"); state._taskPickerCb = null; } });
+
     var levelButtons = $("levelBtns").querySelectorAll(".level-btn");
     for (var i=0;i<levelButtons.length;i++){
       levelButtons[i].addEventListener("click", function(){ startPad(this.getAttribute("data-level")); });
@@ -3108,12 +3619,14 @@ const JS_STR = `
       loadTeam(); loadPosts();
       loadSupAlerts();
       loadPickupAlerts();
+      loadTaskAlerts();
     } else {
       showPin();
     }
-    // Poll for admin notifications (no-op for staff): supplies needing
-    // ordering and pickups needing scheduling, same 45s interval.
-    setInterval(function(){ loadSupAlerts(); loadPickupAlerts(); }, 45000);
+    // One 45s poll drives all notifications (no second loop): supplies
+    // needing ordering, pickups needed, and open tasks (admin banner +
+    // location-scoped staff badge).
+    setInterval(function(){ loadSupAlerts(); loadPickupAlerts(); loadTaskAlerts(); }, 45000);
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
@@ -3133,6 +3646,7 @@ console.log('[OPS] Team initialized: ' + team.length + ' members');
 console.log('[OPS] Posts loaded: ' + posts.length);
 console.log('[OPS] Supplies items: ' + supplies.items.length);
 console.log('[OPS] SOPs loaded: ' + sops.length);
+console.log('[OPS] Tasks loaded: ' + tasks.length);
 server.listen(PORT, function () {
   console.log('[OPS] Running on port ' + PORT);
   console.log('[OPS] Ready — visit /ping to verify');
