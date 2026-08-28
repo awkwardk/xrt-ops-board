@@ -71,6 +71,22 @@ function multipart(fields) {
   return { body: Buffer.from(body, 'utf8'), contentType: 'multipart/form-data; boundary=' + boundary };
 }
 
+/* Build multipart with flat fields + one binary file part (field name "photos"). */
+function multipartWithFile(fields, filename, fileBuf, mime) {
+  const boundary = '----opsTestBoundary' + Date.now();
+  const parts = [];
+  Object.keys(fields).forEach(function (k) {
+    parts.push(Buffer.from('--' + boundary + '\r\nContent-Disposition: form-data; name="' + k + '"\r\n\r\n' + fields[k] + '\r\n', 'utf8'));
+  });
+  parts.push(Buffer.from('--' + boundary + '\r\nContent-Disposition: form-data; name="photos"; filename="' + filename + '"\r\nContent-Type: ' + mime + '\r\n\r\n', 'utf8'));
+  parts.push(fileBuf);
+  parts.push(Buffer.from('\r\n--' + boundary + '--\r\n', 'utf8'));
+  return { body: Buffer.concat(parts), contentType: 'multipart/form-data; boundary=' + boundary };
+}
+
+// 1x1 PNG used as a disposable test photo.
+const TEST_PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC', 'base64');
+
 function waitForServer(retries) {
   return new Promise(function (resolve, reject) {
     function attempt(n) {
@@ -247,19 +263,20 @@ async function run() {
   const tasksAfterFinish = await request({ path: '/api/tasks' });
   const taskStillThere = Array.isArray(tasksAfterFinish.json) &&
     tasksAfterFinish.json.some(function (t) { return t.id === taskId && t.status === 'finished'; });
-  check('POST /api/tasks/:id/finish records finish AND keeps the record (not deleted)',
+  check('POST /api/tasks/:id/finish (zero photos) records finish AND keeps the record',
     tFinished.json && tFinished.json.success === true && tFinished.json.task.status === 'finished' &&
-    tFinished.json.task.finishedBy === 'Reese' && !!tFinished.json.task.finishedAt && taskStillThere,
+    tFinished.json.task.finishedBy === 'Reese' && !!tFinished.json.task.finishedAt && taskStillThere &&
+    Array.isArray(tFinished.json.task.photos) && tFinished.json.task.photos.length === 0,
     JSON.stringify(tFinished.json));
 
-  // 19. delete without admin header -> blocked
+  // delete without admin header -> blocked
   const tDelNoAuth = await request({
     method: 'DELETE', path: '/api/tasks/' + encodeURIComponent(taskId || 'x')
   });
   check('DELETE /api/tasks/:id without admin header -> blocked',
     tDelNoAuth.status === 403 && tDelNoAuth.json && tDelNoAuth.json.success === false, 'status=' + tDelNoAuth.status);
 
-  // 20. delete with admin header -> removed (test cleanup)
+  // delete with admin header -> removed (test cleanup)
   const tDel = await request({
     method: 'DELETE', path: '/api/tasks/' + encodeURIComponent(taskId || 'x'),
     headers: { 'X-Access-Level': 'admin' }
@@ -268,6 +285,52 @@ async function run() {
   const taskGone = Array.isArray(tasksAfterDel.json) && !tasksAfterDel.json.some(function (t) { return t.id === taskId; });
   check('DELETE /api/tasks/:id (admin) removes the task',
     tDel.json && tDel.json.success === true && taskGone, JSON.stringify(tDel.json));
+
+  // ---- Finish WITH photos (multipart) round-trip + delete cleanup ----
+  const tp = await request({
+    method: 'POST', path: '/api/tasks',
+    headers: { 'X-Access-Level': 'admin', 'Content-Type': 'application/json' }
+  }, JSON.stringify({ title: 'Photo task', location: 'Cole', createdBy: 'Marc' }));
+  const pId = tp.json && tp.json.task && tp.json.task.id;
+  await request({
+    method: 'POST', path: '/api/tasks/' + encodeURIComponent(pId || 'x') + '/start',
+    headers: { 'Content-Type': 'application/json' }
+  }, JSON.stringify({ name: 'Nic' }));
+  const mpf = multipartWithFile({ finishedBy: 'Reese' }, 'done.png', TEST_PNG, 'image/png');
+  const pFin = await request({
+    method: 'POST', path: '/api/tasks/' + encodeURIComponent(pId || 'x') + '/finish',
+    headers: { 'Content-Type': mpf.contentType, 'Content-Length': mpf.body.length }
+  }, mpf.body);
+  const photoFn = pFin.json && pFin.json.task && Array.isArray(pFin.json.task.photos) && pFin.json.task.photos[0];
+  check('POST /api/tasks/:id/finish (multipart) stores a completion photo',
+    pFin.json && pFin.json.success === true && pFin.json.task.status === 'finished' &&
+    pFin.json.task.photos.length === 1 && /^\d+-\d+\.(png|jpg)$/.test(String(photoFn)),
+    JSON.stringify(pFin.json));
+
+  // the stored photo is servable (200 with body bytes)
+  const served = await request({ path: '/api/photo/' + encodeURIComponent(photoFn || 'x') });
+  check('GET /api/photo/:fn serves the finish photo (200, non-empty)',
+    served.status === 200 && served.raw.length > 0,
+    'status=' + served.status + ' bytes=' + (served.raw ? served.raw.length : 0));
+
+  // deleting the task removes its photo file from disk
+  await request({
+    method: 'DELETE', path: '/api/tasks/' + encodeURIComponent(pId || 'x'),
+    headers: { 'X-Access-Level': 'admin' }
+  });
+  const servedAfter = await request({ path: '/api/photo/' + encodeURIComponent(photoFn || 'x') });
+  check('DELETE task cleans up its photo file (GET /api/photo -> 404)',
+    servedAfter.status === 404, 'status=' + servedAfter.status);
+
+  // ---- Team canCreateTasks flag ----
+  const teamF = await request({ path: '/api/team' });
+  const flagged = Array.isArray(teamF.json) ? teamF.json.filter(function (m) { return m.canCreateTasks === true; }).map(function (m) { return m.name; }) : [];
+  const marc = teamF.json.find(function (m) { return m.name === 'Marc'; });
+  const reese = teamF.json.find(function (m) { return m.name === 'Reese'; });
+  check('GET /api/team: only Marc + Manuel have canCreateTasks=true',
+    flagged.length === 2 && flagged.indexOf('Marc') !== -1 && flagged.indexOf('Manuel') !== -1 &&
+    marc && marc.canCreateTasks === true && reese && !reese.canCreateTasks,
+    'flagged=' + JSON.stringify(flagged));
 }
 
 let child;

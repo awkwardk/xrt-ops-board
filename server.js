@@ -31,9 +31,9 @@ const DATA_DIR = process.env.OPS_DATA_DIR || path.join('/data', 'ops-data');
 const PHOTOS_DIR = path.join(DATA_DIR, 'photos');
 
 const DEFAULT_TEAM = [
-  { name: 'Marc', location: 'Cole', role: 'admin' },
+  { name: 'Marc', location: 'Cole', role: 'admin', canCreateTasks: true },
   { name: 'Kendall', location: 'Cole', role: 'admin' },
-  { name: 'Manuel', location: 'Cole', role: 'admin' },
+  { name: 'Manuel', location: 'Cole', role: 'admin', canCreateTasks: true },
   { name: 'Reese', location: 'Cole', role: 'staff' },
   { name: 'Nic', location: 'Cole', role: 'staff' },
   { name: 'Gregory', location: 'Visalia', role: 'staff' },
@@ -329,6 +329,22 @@ function savePhotoFile(buffer, mime, originalName) {
   return filename;
 }
 
+/* Delete a list of photo filenames from PHOTOS_DIR (basename-guarded).
+ * Same cleanup the post-delete path does inline; shared by task delete
+ * and orphan-cleanup on a failed finish. */
+function unlinkPhotos(list) {
+  if (!Array.isArray(list)) return;
+  list.forEach(function (fn) {
+    try {
+      const safe = path.basename(String(fn));
+      const file = path.join(PHOTOS_DIR, safe);
+      if (fs.existsSync(file)) fs.unlinkSync(file);
+    } catch (e) {
+      console.error('[OPS] Failed to delete photo ' + fn + ':', e.message);
+    }
+  });
+}
+
 function parseMultipart(buffer, contentType) {
   const result = { fields: {}, photos: [] };
   const m = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType || '');
@@ -556,6 +572,10 @@ function handleAddTeam(req, res) {
       const name = (body.name || '').trim();
       const location = (body.location || '').trim();
       const role = (body.role || 'staff').trim();
+      // Whether this member appears as a "Created by" option on tasks
+      // (location-independent; distinct from staff who only appear as
+      // assignee/start/finish options at their own location).
+      const canCreateTasks = (body.canCreateTasks === true || body.canCreateTasks === 'true');
       if (!name || !location) {
         return sendJson(res, 400, { success: false, error: 'Name and location required' });
       }
@@ -565,7 +585,7 @@ function handleAddTeam(req, res) {
       if (team.some(function (t) { return t.name.toLowerCase() === name.toLowerCase(); })) {
         return sendJson(res, 400, { success: false, error: 'Member already exists' });
       }
-      const member = { name: name, location: location, role: role };
+      const member = { name: name, location: location, role: role, canCreateTasks: canCreateTasks };
       team.push(member);
       saveData('team');
       sendJson(res, 200, member);
@@ -902,6 +922,7 @@ function handleCreateTask(req, res) {
         startedAt: '',
         finishedBy: '',
         finishedAt: '',
+        photos: [],                 // optional completion photos, attached on finish
         createdBy: createdBy,
         createdAt: new Date().toISOString()
       };
@@ -938,23 +959,41 @@ function handleStartTask(req, res, id) {
   });
 }
 
-/* Staff (anyone) finishes a started task — records who + when. Does NOT
- * delete the task; it stays as a completed record. */
+/* Staff (anyone) finishes a started task — records who + when, plus
+ * OPTIONAL completion photos. Accepts multipart/form-data (finishedBy
+ * field + photo files, same shape as post creation) or a JSON fallback.
+ * Does NOT delete the task; it stays as a completed record. */
 function handleFinishTask(req, res, id) {
-  readBody(req, 4 * 1024, function (err, buf) {
-    if (err) return sendJson(res, 400, { success: false, error: err.message });
+  const ct = req.headers['content-type'] || '';
+  // Same cap as posts: 8 photos * 3MB + overhead.
+  readBody(req, 32 * 1024 * 1024, function (err, buf) {
+    if (err) return sendJson(res, 413, { success: false, error: err.message });
     try {
-      const body = JSON.parse(buf.toString('utf8') || '{}');
-      const name = String(body.name || '').trim().slice(0, 100);
-      if (!name) return sendJson(res, 400, { success: false, error: 'Name required' });
+      let fields = {};
+      let photos = [];
+      if (ct.indexOf('multipart/form-data') === 0) {
+        const parsed = parseMultipart(buf, ct);
+        fields = parsed.fields;
+        photos = parsed.photos;
+      } else if (ct.indexOf('application/json') === 0) {
+        fields = JSON.parse(buf.toString('utf8') || '{}');
+      } else {
+        const params = new URLSearchParams(buf.toString('utf8'));
+        params.forEach(function (v, k) { fields[k] = v; });
+      }
+      const name = String(fields.finishedBy || fields.name || '').trim().slice(0, 100);
       const task = tasks.find(function (t) { return t.id === id; });
-      if (!task) return sendJson(res, 404, { success: false, error: 'Task not found' });
+      // On any rejection, uploaded photos are orphaned — clean them up.
+      if (!name) { unlinkPhotos(photos); return sendJson(res, 400, { success: false, error: 'Name required' }); }
+      if (!task) { unlinkPhotos(photos); return sendJson(res, 404, { success: false, error: 'Task not found' }); }
       if (task.status !== 'started') {
+        unlinkPhotos(photos);
         return sendJson(res, 409, { success: false, error: 'Task is not in progress' });
       }
       task.status = 'finished';
       task.finishedBy = name;
       task.finishedAt = new Date().toISOString();
+      task.photos = photos; // filenames on disk (optional; may be empty)
       saveData('tasks');
       sendJson(res, 200, { success: true, task: task });
     } catch (e) {
@@ -967,9 +1006,12 @@ function handleFinishTask(req, res, id) {
 function handleDeleteTask(req, res, id) {
   if (!isAdmin(req)) return sendJson(res, 403, { success: false, error: 'Admin only' });
   const target = decodeURIComponent(id);
+  const removed = tasks.find(function (t) { return t.id === target; });
   const before = tasks.length;
   tasks = tasks.filter(function (t) { return t.id !== target; });
   if (tasks.length === before) return sendJson(res, 404, { success: false, error: 'Not found' });
+  // Clean up any completion photos from disk (mirrors post-delete).
+  if (removed && Array.isArray(removed.photos)) unlinkPhotos(removed.photos);
   saveData('tasks');
   sendJson(res, 200, { success: true });
 }
@@ -1601,6 +1643,17 @@ const BODY_STR = `
       <label>Other / visiting worker name</label>
       <input type="text" id="taskPickerOther" placeholder="Type a name">
     </div>
+    <div class="field hidden" id="taskPickerPhotoSection">
+      <label>Completion photos (optional, up to 8)</label>
+      <div class="photo-btns">
+        <button type="button" class="photo-btn" id="taskTakePhotoBtn">&#128247; Take Photo</button>
+        <button type="button" class="photo-btn" id="taskChooseFileBtn">&#128193; Choose File</button>
+      </div>
+      <input type="file" id="task-in-camera" accept="image/*" capture="environment" class="hidden">
+      <input type="file" id="task-in-photos" accept="image/*" multiple class="hidden">
+      <div class="preview-row" id="taskPreviewRow"></div>
+      <div class="photo-msg" id="taskPhotoMsg"></div>
+    </div>
     <button class="btn-primary" id="taskPickerConfirm">Confirm</button>
     <button class="btn-text" id="taskPickerCancel">Cancel</button>
   </div>
@@ -1760,6 +1813,8 @@ const JS_STR = `
     taskAlertCount: 0,            // tab badge: admin=all open+started, staff=at their location
     taskAlertDismissedAt: 0,      // admin banner dismiss floor
     _taskPickerCb: null,          // pending Start/Finish name-picker callback
+    _taskPickerPhotos: false,     // whether the current picker shows the photo section
+    taskPhotos: [],               // compressed completion photos staged for a finish
     sops: [],                     // XOS entries
     sopQuery: "",                 // XOS search text
     sopVolume: "V1",              // active Volume tab in browse
@@ -2976,6 +3031,8 @@ const JS_STR = `
     for (var j=0;j<fins.length;j++) fins[j].addEventListener("click", function(){ taskFinish(this.getAttribute("data-taskfinish")); });
     var dels = c.querySelectorAll("[data-taskdel]");
     for (var d=0;d<dels.length;d++) dels[d].addEventListener("click", function(){ taskDelete(this.getAttribute("data-taskdel")); });
+    var imgs = c.querySelectorAll(".task-photo");
+    for (var p=0;p<imgs.length;p++) imgs[p].addEventListener("click", function(){ openLightbox(this.getAttribute("data-full")); });
   }
 
   /* Staff: pick a location, see its open/started tasks, Start / Finish them. */
@@ -3045,8 +3102,11 @@ const JS_STR = `
   }
   // Required "Created by" picker — same location-filtered + Other pattern
   // as assignee, but mandatory (a task can't be created without a creator).
+  // Created-by options come from ALL team members flagged canCreateTasks,
+  // regardless of the task's location (unlike assignee, which is
+  // location-filtered). Free-text "Other" fallback stays.
   function taskCreatedBySelectHtml(){
-    var mem = taskMembersAt(state.taskCreateLoc);
+    var mem = state.team.filter(function(m){ return m.canCreateTasks; });
     var opts = '<option value="">Created by… (required)</option>';
     for (var i=0;i<mem.length;i++) opts += '<option value="'+esc(mem[i].name)+'">'+esc(mem[i].name)+'</option>';
     opts += '<option value="__other__">Other / visiting worker…</option>';
@@ -3114,10 +3174,10 @@ const JS_STR = `
     var lsel = $("task-new-loc");
     if (lsel) lsel.addEventListener("change", function(){
       state.taskCreateLoc = this.value;
+      // Only the assignee list is location-filtered; createdBy is not,
+      // so it's left intact (no reset) when the location changes.
       $("task-assignee-wrap").innerHTML = taskAssigneeSelectHtml();
-      $("task-createdby-wrap").innerHTML = taskCreatedBySelectHtml();
       wireAssigneeOther();
-      wireCreatedByOther();
     });
     wireAssigneeOther();
     wireCreatedByOther();
@@ -3138,13 +3198,22 @@ const JS_STR = `
     if (t.finishedAt) lines.push("Finished by " + esc(t.finishedBy) + " &middot; " + esc(shortDateTime(t.finishedAt)));
     var dur = fmtDuration(t.startedAt, t.finishedAt);
     if (dur) lines.push("Duration: " + esc(dur));
+    var photoHtml = "";
+    if (t.photos && t.photos.length){
+      photoHtml = '<div class="photos" style="margin-top:6px">';
+      for (var pi=0;pi<t.photos.length;pi++){
+        var purl = "/api/photo/" + encodeURIComponent(t.photos[pi]);
+        photoHtml += '<img class="task-photo" src="'+purl+'" data-full="'+purl+'" alt="completion photo">';
+      }
+      photoHtml += '</div>';
+    }
     var actions = "";
     if (t.status==="open") actions += '<button class="sup-act order" data-taskstart="'+esc(t.id)+'">Start</button>';
     if (t.status==="started") actions += '<button class="sup-act confirm" data-taskfinish="'+esc(t.id)+'">Finish</button>';
     actions += '<button class="sup-act del" data-taskdel="'+esc(t.id)+'">Delete</button>';
     return '<div class="sup-arow"><div class="sup-arow-top">'+
       '<div style="flex:1"><div class="sup-name">'+esc(t.title)+'</div>'+
-      '<div class="sup-loc-tag">'+lines.join("<br>")+'</div></div>'+
+      '<div class="sup-loc-tag">'+lines.join("<br>")+'</div>'+photoHtml+'</div>'+
       '<span class="sup-status '+sc+'">'+stLabel+'</span></div>'+
       '<div class="sup-actions" style="margin-top:8px">'+actions+'</div></div>';
   }
@@ -3185,27 +3254,80 @@ const JS_STR = `
   }
   function taskFinish(id){
     var t = state.taskData.filter(function(x){ return x.id===id; })[0]; if (!t) return;
+    // showPhotos=true: finish offers the optional completion-photo capture.
     openTaskPicker(t.location, "Who is finishing this task?", function(name){
-      fetch("/api/tasks/"+encodeURIComponent(id)+"/finish", { method:"POST", headers: headers(true),
-        body: JSON.stringify({ name:name }) })
+      var fd = new FormData();
+      fd.append("finishedBy", name);
+      for (var i=0;i<state.taskPhotos.length;i++) fd.append("photos", state.taskPhotos[i], "photo"+(i+1)+".jpg");
+      // headers(false): no JSON Content-Type, so the browser sets the
+      // multipart boundary (same as post submission).
+      fetch("/api/tasks/"+encodeURIComponent(id)+"/finish", { method:"POST", headers: headers(false), body: fd })
         .then(function(r){ return r.json(); })
         .then(function(res){ if (res && res.success){ taskToast("Finished"); loadTasks(); } else taskToast((res&&res.error)||"Could not finish"); })
         .catch(function(){ taskToast("Network error"); });
+    }, true);
+  }
+
+  /* ---- optional completion-photo capture (reuses shared compressPhoto) ---- */
+  function renderTaskPreviews(){
+    var row = $("taskPreviewRow"); if (!row) return;
+    row.innerHTML = "";
+    state.taskPhotos.forEach(function(file, idx){
+      var reader = new FileReader();
+      reader.onload = function(e){
+        var div = document.createElement("div");
+        div.className = "preview";
+        div.innerHTML = '<img src="'+e.target.result+'"><button class="rm" data-rm="'+idx+'">&times;</button>';
+        div.querySelector(".rm").addEventListener("click", function(){
+          state.taskPhotos.splice(idx,1); hideTaskPhotoMsg(); renderTaskPreviews();
+        });
+        row.appendChild(div);
+      };
+      reader.readAsDataURL(file);
     });
   }
+  function showTaskPhotoMsg(text){ var el=$("taskPhotoMsg"); if(el){ el.textContent=text; el.classList.add("show"); } }
+  function hideTaskPhotoMsg(){ var el=$("taskPhotoMsg"); if(el){ el.textContent=""; el.classList.remove("show"); } }
+  function onTaskPhotoSelect(e){
+    var files = Array.prototype.slice.call(e.target.files).filter(function(f){ return f.type.indexOf("image/")===0; });
+    e.target.value = "";
+    var capacity = Math.max(0, 8 - state.taskPhotos.length);
+    if (files.length > capacity){ showTaskPhotoMsg("Max 8 photos \\u2014 " + (files.length - capacity) + " not added."); }
+    else { hideTaskPhotoMsg(); }
+    files.forEach(function(file){
+      compressPhoto(file, function(blob){
+        if (state.taskPhotos.length >= 8) return;
+        state.taskPhotos.push(blob);
+        renderTaskPreviews();
+      });
+    });
+  }
+
   // Name picker filtered to the task's location, with a free-text fallback
-  // (not a hard lock-out — "Other / visiting worker" always available).
-  function openTaskPicker(location, promptText, cb){
+  // (not a hard lock-out). showPhotos toggles the optional finish-photo UI.
+  function openTaskPicker(location, promptText, cb, showPhotos){
     state._taskPickerCb = cb;
+    state._taskPickerPhotos = !!showPhotos;
     $("taskPickerTitle").textContent = promptText;
     var mem = taskMembersAt(location);
     var opts = '<option value="">Select name…</option>';
     for (var i=0;i<mem.length;i++) opts += '<option value="'+esc(mem[i].name)+'">'+esc(mem[i].name)+'</option>';
     opts += '<option value="__other__">Other / visiting worker…</option>';
     $("taskPickerSelect").innerHTML = opts;
+    $("taskPickerSelect").value = "";
     $("taskPickerOther").value = "";
     $("taskPickerOtherField").classList.add("hidden");
+    state.taskPhotos = [];
+    renderTaskPreviews();
+    hideTaskPhotoMsg();
+    if (showPhotos) $("taskPickerPhotoSection").classList.remove("hidden");
+    else $("taskPickerPhotoSection").classList.add("hidden");
     $("taskPickerOverlay").classList.add("show");
+  }
+  function taskPickerCancel(){
+    $("taskPickerOverlay").classList.remove("show");
+    state._taskPickerCb = null;
+    state.taskPhotos = [];
   }
   function taskPickerConfirm(){
     var v = $("taskPickerSelect").value;
@@ -3213,7 +3335,7 @@ const JS_STR = `
     if (!name){ taskToast("Pick or type a name"); return; }
     $("taskPickerOverlay").classList.remove("show");
     var cb = state._taskPickerCb; state._taskPickerCb = null;
-    if (cb) cb(name);
+    if (cb) cb(name); // cb reads state.taskPhotos synchronously (finish)
   }
 
   /* ---------- SOPs ---------- */
@@ -3627,8 +3749,13 @@ const JS_STR = `
       else $("taskPickerOtherField").classList.add("hidden");
     });
     $("taskPickerConfirm").addEventListener("click", taskPickerConfirm);
-    $("taskPickerCancel").addEventListener("click", function(){ $("taskPickerOverlay").classList.remove("show"); state._taskPickerCb = null; });
-    $("taskPickerOverlay").addEventListener("click", function(e){ if (e.target===this){ $("taskPickerOverlay").classList.remove("show"); state._taskPickerCb = null; } });
+    $("taskPickerCancel").addEventListener("click", taskPickerCancel);
+    $("taskPickerOverlay").addEventListener("click", function(e){ if (e.target===this){ taskPickerCancel(); } });
+    // Completion-photo capture in the finish picker (reuses post photo logic).
+    $("taskTakePhotoBtn").addEventListener("click", function(){ $("task-in-camera").click(); });
+    $("taskChooseFileBtn").addEventListener("click", function(){ $("task-in-photos").click(); });
+    $("task-in-camera").addEventListener("change", onTaskPhotoSelect);
+    $("task-in-photos").addEventListener("change", onTaskPhotoSelect);
 
     var levelButtons = $("levelBtns").querySelectorAll(".level-btn");
     for (var i=0;i<levelButtons.length;i++){
