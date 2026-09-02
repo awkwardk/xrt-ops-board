@@ -239,10 +239,12 @@ async function run() {
     headers: { 'X-Access-Level': 'admin', 'Content-Type': 'application/json' }
   }, JSON.stringify({ title: 'Test task', location: 'Cole', assignedTo: 'Reese', createdBy: 'Manuel' }));
   const taskId = tCreated.json && tCreated.json.task && tCreated.json.task.id;
-  check('POST /api/tasks (admin) creates a task (status open, createdBy stored)',
+  check('POST /api/tasks (admin, zero photos) creates open task with empty referencePhotos + photos',
     !!taskId && tCreated.json.task.status === 'open' && tCreated.json.task.location === 'Cole' &&
     tCreated.json.task.assignedTo === 'Reese' && tCreated.json.task.createdBy === 'Manuel' &&
-    !!tCreated.json.task.createdAt,
+    !!tCreated.json.task.createdAt &&
+    Array.isArray(tCreated.json.task.referencePhotos) && tCreated.json.task.referencePhotos.length === 0 &&
+    Array.isArray(tCreated.json.task.photos) && tCreated.json.task.photos.length === 0,
     JSON.stringify(tCreated.json));
 
   // 18. start (staff, no admin) -> started + startedBy/At
@@ -321,6 +323,51 @@ async function run() {
   const servedAfter = await request({ path: '/api/photo/' + encodeURIComponent(photoFn || 'x') });
   check('DELETE task cleans up its photo file (GET /api/photo -> 404)',
     servedAfter.status === 404, 'status=' + servedAfter.status);
+
+  // ---- Reference photo at CREATE, kept separate from completion photo ----
+  const rpMp = multipartWithFile({ title: 'Ref task', location: 'Cole', createdBy: 'Marc' }, 'ref.png', TEST_PNG, 'image/png');
+  const rpCreate = await request({
+    method: 'POST', path: '/api/tasks',
+    headers: { 'X-Access-Level': 'admin', 'Content-Type': rpMp.contentType, 'Content-Length': rpMp.body.length }
+  }, rpMp.body);
+  const rpId = rpCreate.json && rpCreate.json.task && rpCreate.json.task.id;
+  const refFn = rpCreate.json && rpCreate.json.task && Array.isArray(rpCreate.json.task.referencePhotos) && rpCreate.json.task.referencePhotos[0];
+  check('POST /api/tasks (multipart) stores a reference photo, completion empty',
+    !!rpId && rpCreate.json.task.referencePhotos.length === 1 && rpCreate.json.task.photos.length === 0 &&
+    /^\d+-\d+\.(png|jpg)$/.test(String(refFn)),
+    JSON.stringify(rpCreate.json && rpCreate.json.task));
+
+  const refServed = await request({ path: '/api/photo/' + encodeURIComponent(refFn || 'x') });
+  check('GET /api/photo/:fn serves the reference photo (200, non-empty)',
+    refServed.status === 200 && refServed.raw.length > 0, 'status=' + refServed.status);
+
+  // finish it with a DISTINCT completion photo — both must coexist, not merge
+  await request({
+    method: 'POST', path: '/api/tasks/' + encodeURIComponent(rpId || 'x') + '/start',
+    headers: { 'Content-Type': 'application/json' }
+  }, JSON.stringify({ name: 'Nic' }));
+  const compMp = multipartWithFile({ finishedBy: 'Reese' }, 'comp.png', TEST_PNG, 'image/png');
+  const rpFin = await request({
+    method: 'POST', path: '/api/tasks/' + encodeURIComponent(rpId || 'x') + '/finish',
+    headers: { 'Content-Type': compMp.contentType, 'Content-Length': compMp.body.length }
+  }, compMp.body);
+  const compFn = rpFin.json && rpFin.json.task && rpFin.json.task.photos[0];
+  check('reference + completion photos coexist and are DISTINCT files',
+    rpFin.json && rpFin.json.success === true &&
+    rpFin.json.task.referencePhotos.length === 1 && rpFin.json.task.referencePhotos[0] === refFn &&
+    rpFin.json.task.photos.length === 1 && String(compFn) !== String(refFn),
+    'ref=' + refFn + ' comp=' + compFn);
+
+  // delete cleans up BOTH photo files
+  await request({
+    method: 'DELETE', path: '/api/tasks/' + encodeURIComponent(rpId || 'x'),
+    headers: { 'X-Access-Level': 'admin' }
+  });
+  const refAfter = await request({ path: '/api/photo/' + encodeURIComponent(refFn || 'x') });
+  const compAfter = await request({ path: '/api/photo/' + encodeURIComponent(compFn || 'x') });
+  check('DELETE task cleans up BOTH reference and completion photos (both 404)',
+    refAfter.status === 404 && compAfter.status === 404,
+    'ref=' + refAfter.status + ' comp=' + compAfter.status);
 
   // ---- Team canCreateTasks flag ----
   const teamF = await request({ path: '/api/team' });

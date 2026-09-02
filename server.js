@@ -897,19 +897,39 @@ function handleGetTasks(req, res) {
 }
 
 /* Admin creates a task, optionally pointed at a specific person. */
+/* Admin creates a task. Accepts multipart/form-data (title, location,
+ * assignedTo, createdBy fields + OPTIONAL reference photo files, same
+ * shape as finish) or a JSON fallback. Reference photos are stored under
+ * referencePhotos — a SEPARATE field from completion photos (photos),
+ * which are only attached later on finish. */
 function handleCreateTask(req, res) {
   if (!isAdmin(req)) return sendJson(res, 403, { success: false, error: 'Admin only' });
-  readBody(req, 16 * 1024, function (err, buf) {
-    if (err) return sendJson(res, 400, { success: false, error: err.message });
+  const ct = req.headers['content-type'] || '';
+  // Same cap as posts/finish: 8 photos * 3MB + overhead.
+  readBody(req, 32 * 1024 * 1024, function (err, buf) {
+    if (err) return sendJson(res, 413, { success: false, error: err.message });
     try {
-      const body = JSON.parse(buf.toString('utf8') || '{}');
-      const title = String(body.title || '').trim().slice(0, 300);
-      const location = String(body.location || '').trim();
-      const assignedTo = String(body.assignedTo || '').trim().slice(0, 100);
-      const createdBy = String(body.createdBy || '').trim().slice(0, 100);
-      if (!title) return sendJson(res, 400, { success: false, error: 'Title required' });
-      if (!createdBy) return sendJson(res, 400, { success: false, error: 'Created by required' });
+      let fields = {};
+      let photos = [];
+      if (ct.indexOf('multipart/form-data') === 0) {
+        const parsed = parseMultipart(buf, ct);
+        fields = parsed.fields;
+        photos = parsed.photos;
+      } else if (ct.indexOf('application/json') === 0) {
+        fields = JSON.parse(buf.toString('utf8') || '{}');
+      } else {
+        const params = new URLSearchParams(buf.toString('utf8'));
+        params.forEach(function (v, k) { fields[k] = v; });
+      }
+      const title = String(fields.title || '').trim().slice(0, 300);
+      const location = String(fields.location || '').trim();
+      const assignedTo = String(fields.assignedTo || '').trim().slice(0, 100);
+      const createdBy = String(fields.createdBy || '').trim().slice(0, 100);
+      // On any rejection, uploaded reference photos are orphaned — clean up.
+      if (!title) { unlinkPhotos(photos); return sendJson(res, 400, { success: false, error: 'Title required' }); }
+      if (!createdBy) { unlinkPhotos(photos); return sendJson(res, 400, { success: false, error: 'Created by required' }); }
       if (TASK_LOCATIONS.indexOf(location) === -1) {
+        unlinkPhotos(photos);
         return sendJson(res, 400, { success: false, error: 'Invalid location' });
       }
       const task = {
@@ -922,7 +942,8 @@ function handleCreateTask(req, res) {
         startedAt: '',
         finishedBy: '',
         finishedAt: '',
-        photos: [],                 // optional completion photos, attached on finish
+        referencePhotos: photos,    // OPTIONAL photos of what the task should look like (at creation)
+        photos: [],                 // OPTIONAL completion photos, attached on finish (kept separate)
         createdBy: createdBy,
         createdAt: new Date().toISOString()
       };
@@ -1010,8 +1031,11 @@ function handleDeleteTask(req, res, id) {
   const before = tasks.length;
   tasks = tasks.filter(function (t) { return t.id !== target; });
   if (tasks.length === before) return sendJson(res, 404, { success: false, error: 'Not found' });
-  // Clean up any completion photos from disk (mirrors post-delete).
-  if (removed && Array.isArray(removed.photos)) unlinkPhotos(removed.photos);
+  // Clean up BOTH reference and completion photos from disk (shared helper).
+  if (removed) {
+    unlinkPhotos(removed.referencePhotos);
+    unlinkPhotos(removed.photos);
+  }
   saveData('tasks');
   sendJson(res, 200, { success: true });
 }
@@ -1350,6 +1374,8 @@ header{position:sticky; top:0; z-index:20; background:#fff;
 .photos{display:flex; gap:6px; margin-top:8px; flex-wrap:wrap;}
 .photos img{width:80px; height:80px; object-fit:cover; border-radius:8px;
   border:1px solid var(--border);}
+.task-photo-label{font-size:10px; font-weight:700; color:var(--text2);
+  text-transform:uppercase; letter-spacing:.4px; margin-top:8px;}
 .card-actions{display:flex; justify-content:flex-end; margin-top:8px;}
 .del-btn{border:none; background:var(--urgent-l); color:var(--urgent);
   border-radius:8px; min-height:36px; padding:6px 14px; font-size:14px; font-weight:600;}
@@ -1815,6 +1841,7 @@ const JS_STR = `
     _taskPickerCb: null,          // pending Start/Finish name-picker callback
     _taskPickerPhotos: false,     // whether the current picker shows the photo section
     taskPhotos: [],               // compressed completion photos staged for a finish
+    taskRefPhotos: [],            // compressed reference photos staged for a create
     sops: [],                     // XOS entries
     sopQuery: "",                 // XOS search text
     sopVolume: "V1",              // active Volume tab in browse
@@ -3078,9 +3105,10 @@ const JS_STR = `
     var btn = t.status==="open"
       ? '<button class="sup-act order" data-taskstart="'+esc(t.id)+'">Start</button>'
       : '<button class="sup-act confirm" data-taskfinish="'+esc(t.id)+'">Finish</button>';
+    var refHtml = taskPhotoThumbs(t.referencePhotos, "Reference photos");
     return '<div class="sup-row '+sc+'"><div style="flex:1">'+
       '<div class="sup-name">'+esc(t.title)+'</div>'+
-      '<div class="sup-cat">'+meta.join(" &middot; ")+'</div></div>'+
+      '<div class="sup-cat">'+meta.join(" &middot; ")+'</div>'+refHtml+'</div>'+
       '<span class="sup-status '+sc+'">'+st+'</span>'+btn+'</div>';
   }
 
@@ -3141,6 +3169,17 @@ const JS_STR = `
         '<select id="task-new-loc">'+locOpts+'</select>'+
         '<div id="task-assignee-wrap">'+taskAssigneeSelectHtml()+'</div>'+
         '<div id="task-createdby-wrap">'+taskCreatedBySelectHtml()+'</div>'+
+        '<div class="field" style="margin-bottom:0">'+
+          '<label>Reference photos (optional, up to 8) — what the task should look like</label>'+
+          '<div class="photo-btns">'+
+            '<button type="button" class="photo-btn" id="taskRefTakeBtn">&#128247; Take Photo</button>'+
+            '<button type="button" class="photo-btn" id="taskRefChooseBtn">&#128193; Choose File</button>'+
+          '</div>'+
+          '<input type="file" id="task-ref-camera" accept="image/*" capture="environment" class="hidden">'+
+          '<input type="file" id="task-ref-photos" accept="image/*" multiple class="hidden">'+
+          '<div class="preview-row" id="taskRefPreviewRow"></div>'+
+          '<div class="photo-msg" id="taskRefPhotoMsg"></div>'+
+        '</div>'+
         '<button class="btn-primary" id="task-create-btn">Create task</button>'+
       '</div></div>';
 
@@ -3181,12 +3220,30 @@ const JS_STR = `
     });
     wireAssigneeOther();
     wireCreatedByOther();
+    // Reference-photo capture on the create form (reuses the shared
+    // compressPhoto; kept on its own state.taskRefPhotos array). The form
+    // is rebuilt on every render, so re-wire + re-draw previews from state.
+    $("taskRefTakeBtn").addEventListener("click", function(){ $("task-ref-camera").click(); });
+    $("taskRefChooseBtn").addEventListener("click", function(){ $("task-ref-photos").click(); });
+    $("task-ref-camera").addEventListener("change", onTaskRefPhotoSelect);
+    $("task-ref-photos").addEventListener("change", onTaskRefPhotoSelect);
+    renderTaskRefPreviews();
     var cbtn = $("task-create-btn"); if (cbtn) cbtn.addEventListener("click", taskCreate);
     var flls = $("tasks").querySelectorAll("[data-taskflloc]");
     for (var a=0;a<flls.length;a++) flls[a].addEventListener("click", function(){ state.taskFilterLoc = this.getAttribute("data-taskflloc"); renderTasksAdmin(); });
     var flss = $("tasks").querySelectorAll("[data-taskflst]");
     for (var b=0;b<flss.length;b++) flss[b].addEventListener("click", function(){ state.taskFilterStatus = this.getAttribute("data-taskflst"); renderTasksAdmin(); });
     wireTaskActions();
+  }
+  // Labeled thumbnail group (reference vs completion), tappable to lightbox.
+  function taskPhotoThumbs(list, label){
+    if (!Array.isArray(list) || !list.length) return "";
+    var html = '<div class="task-photo-label">'+esc(label)+'</div><div class="photos" style="margin-top:4px">';
+    for (var i=0;i<list.length;i++){
+      var purl = "/api/photo/" + encodeURIComponent(list[i]);
+      html += '<img class="task-photo" src="'+purl+'" data-full="'+purl+'" alt="'+esc(label)+'">';
+    }
+    return html + '</div>';
   }
   function taskAdminRow(t){
     var sc = t.status==="finished" ? "ordered" : (t.status==="started" ? "confirmed" : "flagged");
@@ -3198,22 +3255,15 @@ const JS_STR = `
     if (t.finishedAt) lines.push("Finished by " + esc(t.finishedBy) + " &middot; " + esc(shortDateTime(t.finishedAt)));
     var dur = fmtDuration(t.startedAt, t.finishedAt);
     if (dur) lines.push("Duration: " + esc(dur));
-    var photoHtml = "";
-    if (t.photos && t.photos.length){
-      photoHtml = '<div class="photos" style="margin-top:6px">';
-      for (var pi=0;pi<t.photos.length;pi++){
-        var purl = "/api/photo/" + encodeURIComponent(t.photos[pi]);
-        photoHtml += '<img class="task-photo" src="'+purl+'" data-full="'+purl+'" alt="completion photo">';
-      }
-      photoHtml += '</div>';
-    }
+    var refHtml = taskPhotoThumbs(t.referencePhotos, "Reference photos");   // near the top
+    var compHtml = taskPhotoThumbs(t.photos, "Completion photos");          // near the finish info
     var actions = "";
     if (t.status==="open") actions += '<button class="sup-act order" data-taskstart="'+esc(t.id)+'">Start</button>';
     if (t.status==="started") actions += '<button class="sup-act confirm" data-taskfinish="'+esc(t.id)+'">Finish</button>';
     actions += '<button class="sup-act del" data-taskdel="'+esc(t.id)+'">Delete</button>';
     return '<div class="sup-arow"><div class="sup-arow-top">'+
-      '<div style="flex:1"><div class="sup-name">'+esc(t.title)+'</div>'+
-      '<div class="sup-loc-tag">'+lines.join("<br>")+'</div>'+photoHtml+'</div>'+
+      '<div style="flex:1"><div class="sup-name">'+esc(t.title)+'</div>'+refHtml+
+      '<div class="sup-loc-tag">'+lines.join("<br>")+'</div>'+compHtml+'</div>'+
       '<span class="sup-status '+sc+'">'+stLabel+'</span></div>'+
       '<div class="sup-actions" style="margin-top:8px">'+actions+'</div></div>';
   }
@@ -3226,14 +3276,61 @@ const JS_STR = `
     var createdBy = (cbv==="__other__") ? ($("task-new-createdby-other").value||"").trim() : cbv;
     if (!title){ taskToast("Enter a task title"); return; }
     if (!createdBy){ taskToast("Select who is creating this task"); return; }
-    fetch("/api/tasks", { method:"POST", headers: headers(true),
-      body: JSON.stringify({ title:title, location:loc, assignedTo:assignedTo, createdBy:createdBy }) })
+    // Multipart so optional reference photos ride along (headers(false):
+    // browser sets the multipart boundary; admin header still included).
+    var fd = new FormData();
+    fd.append("title", title);
+    fd.append("location", loc);
+    fd.append("assignedTo", assignedTo);
+    fd.append("createdBy", createdBy);
+    for (var i=0;i<state.taskRefPhotos.length;i++) fd.append("photos", state.taskRefPhotos[i], "ref"+(i+1)+".jpg");
+    fetch("/api/tasks", { method:"POST", headers: headers(false), body: fd })
       .then(function(r){ return r.json(); })
       .then(function(res){
-        if (res && res.success){ $("task-new-title").value=""; taskToast("Task created"); loadTasks(); }
-        else taskToast((res&&res.error)||"Could not create task");
+        if (res && res.success){
+          $("task-new-title").value="";
+          state.taskRefPhotos = [];
+          renderTaskRefPreviews();
+          hideTaskRefPhotoMsg();
+          taskToast("Task created");
+          loadTasks();
+        } else taskToast((res&&res.error)||"Could not create task");
       })
       .catch(function(){ taskToast("Network error"); });
+  }
+  /* ---- optional reference-photo capture on create (mirrors finish capture) ---- */
+  function renderTaskRefPreviews(){
+    var row = $("taskRefPreviewRow"); if (!row) return;
+    row.innerHTML = "";
+    state.taskRefPhotos.forEach(function(file, idx){
+      var reader = new FileReader();
+      reader.onload = function(e){
+        var div = document.createElement("div");
+        div.className = "preview";
+        div.innerHTML = '<img src="'+e.target.result+'"><button class="rm" data-rm="'+idx+'">&times;</button>';
+        div.querySelector(".rm").addEventListener("click", function(){
+          state.taskRefPhotos.splice(idx,1); hideTaskRefPhotoMsg(); renderTaskRefPreviews();
+        });
+        row.appendChild(div);
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+  function showTaskRefPhotoMsg(text){ var el=$("taskRefPhotoMsg"); if(el){ el.textContent=text; el.classList.add("show"); } }
+  function hideTaskRefPhotoMsg(){ var el=$("taskRefPhotoMsg"); if(el){ el.textContent=""; el.classList.remove("show"); } }
+  function onTaskRefPhotoSelect(e){
+    var files = Array.prototype.slice.call(e.target.files).filter(function(f){ return f.type.indexOf("image/")===0; });
+    e.target.value = "";
+    var capacity = Math.max(0, 8 - state.taskRefPhotos.length);
+    if (files.length > capacity){ showTaskRefPhotoMsg("Max 8 photos \\u2014 " + (files.length - capacity) + " not added."); }
+    else { hideTaskRefPhotoMsg(); }
+    files.forEach(function(file){
+      compressPhoto(file, function(blob){
+        if (state.taskRefPhotos.length >= 8) return;
+        state.taskRefPhotos.push(blob);
+        renderTaskRefPreviews();
+      });
+    });
   }
   function taskDelete(id){
     if (!confirm("Delete this task record? This cannot be undone.")) return;
