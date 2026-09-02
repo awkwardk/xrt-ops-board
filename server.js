@@ -3151,7 +3151,7 @@ const JS_STR = `
       locFilter += '<button class="sup-pill'+(L===state.taskFilterLoc?" active":"")+'" data-taskflloc="'+esc(L)+'">'+esc(L)+'</button>';
     }
     var statusFilter =
-      '<button class="sup-pill'+(state.taskFilterStatus==="open"?" active":"")+'" data-taskflst="open">Open</button>'+
+      '<button class="sup-pill'+(state.taskFilterStatus==="open"?" active":"")+'" data-taskflst="open">Open Tasks</button>'+
       '<button class="sup-pill'+(state.taskFilterStatus==="completed"?" active":"")+'" data-taskflst="completed">Completed</button>';
 
     var list = all.filter(function(t){
